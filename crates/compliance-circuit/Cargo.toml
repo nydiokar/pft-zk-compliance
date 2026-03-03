@@ -1,0 +1,10 @@
+[package]
+name = "compliance-circuit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2" }
+
+[dev-dependencies]
+rand = "0.8"
