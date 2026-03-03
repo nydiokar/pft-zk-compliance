@@ -1,6 +1,6 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{Circuit, Column, ConstraintSystem, Error, Instance},
+    plonk::{Circuit, Column, ConstraintSystem, ErrorFront, Instance},
 };
 
 /// Public inputs committed on-chain and visible to verifiers.
@@ -79,7 +79,7 @@ impl<F: halo2_proofs::arithmetic::Field> Circuit<F> for ComplianceCircuit {
         &self,
         _config: Self::Config,
         mut _layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // TODO(Step 1): implement circuit synthesis
         // Region 1: load witness values into advice columns
         // Region 2: apply Poseidon hash gate (C3 constraint)
