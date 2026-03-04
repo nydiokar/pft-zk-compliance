@@ -1,6 +1,6 @@
 # pf-zk-compliance — Project Context
 
-**Branch:** `master`  **Last Updated:** 2026-03-04  **Status:** Scaffold complete + SPEC.md v1.0 published
+**Branch:** `master`  **Last Updated:** 2026-03-04  **Status:** Circuit prototype implemented + MockProver passing (4/4 tests)
 
 ---
 
@@ -13,8 +13,8 @@
 | ✅ | **[ZK-2] Sidecar IPC schema** | 🟢 S | JSON-over-socket request/response schema. ProofRequest + ProofResponse structs in `crates/compliance-sidecar/src/main.rs`. Documented in §3 of SPEC.md. |
 | ✅ | **[ZK-3] Consensus fallback design** | 🟡 M | Timeout → quarantine → BFT quorum vote. Pessimistic mode on sidecar crash. 2f+1 rejection receipt logic. Documented in §4 of SPEC.md. |
 | ✅ | **[ZK-4] SPEC.md published** | 🟢 S | Full architecture spec published to GitHub Gist: https://gist.github.com/nydiokar/b5f41e8638382c1eec3a571d891b5d51 |
-| 🔲 | **[ZK-5] Circuit `configure` impl** | 🔴 L | Add advice columns, selectors, Poseidon gate, Merkle path gate, range check lookup table. Replace stubs in `circuit.rs`. |
-| 🔲 | **[ZK-6] Circuit `synthesize` impl** | 🔴 L | Assign witness values into regions. Wire C1/C2 (Merkle verify) and C3 (hash binding) constraints. |
+| ✅ | **[ZK-5] Circuit `configure` impl** | 🔴 L | Advice columns (a/b/c), fixed constants, instance, selectors s_hash/s_merkle/s_range, three gates. Prototype substitutions annotated inline with PROTOTYPE/PRODUCTION comments. |
+| ✅ | **[ZK-6] Circuit `synthesize` impl** | 🔴 L | 5 regions: load_witness, range_check, hash_binding (C3), sender_merkle (C1), receiver_merkle (C2). All public inputs wired to instance column via constrain_instance. 4 MockProver tests pass (valid + 3 rejection cases). |
 | 🔲 | **[ZK-7] Sidecar socket listener** | 🟡 M | Replace daemon loop stub with real Unix socket / named pipe listener. Accept + dispatch ProofRequests. |
 | 🔲 | **[ZK-8] Key generation CLI** | 🟡 M | `compliance-sidecar keygen --k 12` command. Output .pk / .vk files. |
 | 🔲 | **[ZK-9] postfiatd IPC hook** | 🔴 L | C++ side of the socket interface in postfiatd. Calls sidecar before forwarding tx to RPCA consensus. |
@@ -51,17 +51,18 @@
 |:-----|:--------|
 | `SPEC.md` | Publishable architecture spec (v1.0 final) |
 | `docs/circuit_io.md` | Detailed circuit input table + constraint equations |
-| `crates/compliance-circuit/src/circuit.rs` | ComplianceCircuit struct + Circuit trait skeleton |
-| `crates/compliance-sidecar/src/main.rs` | Sidecar daemon loop + IPC types |
+| `crates/compliance-circuit/src/circuit.rs` | Full ComplianceCircuit: configure, synthesize, 4 MockProver tests |
+| `crates/compliance-sidecar/src/main.rs` | Sidecar daemon loop + IPC types (stub, awaits ZK-7) |
 
 ---
 
 ## Known Issues / Notes
 
-- `[u8; 20]` address type in circuit is a placeholder — XRPL uses base58 classic addresses. Track as ZK-10.
-- PSE halo2 v0.4 quirk: `Circuit::synthesize` returns `Result<(), ErrorFront>` not `Error`. Import `halo2_proofs::plonk::ErrorFront`.
-- `cargo check` passes with dead-code warnings on stub fields — expected until ZK-5/ZK-6 are implemented.
-- postfiatd is C++ (rippled fork). The sidecar is Rust. The IPC socket boundary is the integration point — no C++ changes needed until ZK-9.
+- **[ZK-10 open]** `[u8; 20]` address type in `Witness` struct is still an Ethereum-style placeholder. XRPL uses base58 classic addresses (different encoding). Needs a dedicated encoding layer before production.
+- **[open]** PSE halo2 git dep is unpinned (`git = "..."` without a rev). Must pin to a specific commit before any production deployment to prevent supply-chain drift.
+- **[open, by design]** Prototype gates use linear arithmetic (`a + b = c`) in place of Poseidon. Circuit enforces the correct constraint topology but is not cryptographically collision-resistant. Every substitution is annotated inline in `circuit.rs` with `PROTOTYPE:` / `PRODUCTION:` comments.
+- **[open, by design]** Instance column wires only one folded field element per public input (`tx_hash`, `merkle_root`). Production circuit would wire all 32 individual byte cells to match the full `[u8; 32]` layout in `docs/circuit_io.md`.
+- **[open]** postfiatd is C++ (rippled fork). No C++ changes needed until ZK-9 (IPC hook).
 
 ---
 

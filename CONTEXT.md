@@ -43,9 +43,64 @@ specific commit hash to prevent supply-chain drift.
 
 ---
 
+## Session 2026-03-04 — Circuit Implementation
+
+### What was done
+
+Implemented the full `ComplianceCircuit` in `crates/compliance-circuit/src/circuit.rs`.
+
+**Configure:**
+- Three advice columns (`a`, `b`, `c`), one fixed constants column, one instance column
+- Three selectors: `s_hash`, `s_merkle`, `s_range`
+- `hash_binding` gate: `a + b = c` (C3)
+- `merkle_path` gate: `node + sibling = parent` (C1/C2 per level)
+- `range_check` gate: placeholder selector (tautological in prototype)
+
+**Synthesize (5 regions):**
+1. `load_witness` — assigns sender, receiver, amount into advice cells
+2. `range_check` — copies amount into range-check row (gate fires, does nothing yet)
+3. `hash_binding` — copies sender+receiver, assigns tx_hash_out, wires to instance[0]
+4. `sender_merkle` — MERKLE_DEPTH rows of path traversal, root wired to instance[32]
+5. `receiver_merkle` — same structure, root wired to instance[32] (same compliance root)
+6. `block_height` — assigns bh into advice, wires to instance[64]
+
+**Instance wiring fix:**
+Previous scaffold had no `constrain_instance` calls — public inputs were declared
+but never enforced. Added wiring for all three public commitments so the MockProver
+permutation checker actually validates them.
+
+**Prototype substitutions (documented inline with PROTOTYPE/PRODUCTION comments):**
+
+| Spec (circuit_io.md) | Prototype | Reason |
+|---|---|---|
+| `Poseidon(sender ‖ receiver ‖ amount)` | `sender_sum + receiver_sum` | `halo2_gadgets` adds heavy dep + chip complexity |
+| `Poseidon(left, right)` at each Merkle level | `left + right` | Same reason; path structure is production-correct |
+| Lookup table range check | Tautological gate `s*(a-a)=0` | Lookup table needs a separate fixed table column |
+| `bytes_to_field`: Poseidon sponge | Sum of byte values | Prototype encoding; not collision-resistant |
+
+**Tests (all passing, `cargo test -p compliance-circuit`):**
+- `test_valid_witness_passes` — MockProver verify() succeeds for valid witness
+- `test_wrong_tx_hash_fails` — corrupted instance[0] → permutation error
+- `test_wrong_merkle_root_fails` — corrupted instance[32] → permutation error
+- `test_wrong_merkle_path_fails` — flipped sibling byte → root_anchor constrain_equal fails
+
+**Key Halo2 API insight:**
+`constrain_instance` is a `Layouter`-level call (not `Region`-level). It records a
+copy-constraint in the permutation argument. MockProver.verify() checks all copy
+constraints — including instance ones — automatically via the permutation checker.
+No special instance verification step needed.
+
+**Published:** https://github.com/nydiokar/pft-zk-compliance (commit d43ab7c)
+
+---
+
 ## TODO (next sessions)
-- [ ] Step 1: Implement `configure` and `synthesize` in `circuit.rs`
-- [ ] Step 2: Wire up actual proof generation in sidecar (halo2_proofs::plonk::create_proof)
+- [x] Step 1: Implement `configure` and `synthesize` in `circuit.rs`
+- [x] Step 5: Push to GitHub remote
+- [ ] Step 2: Wire up actual proof generation in sidecar (`halo2_proofs::plonk::create_proof`)
 - [ ] Step 3: Implement rejection state machine
 - [ ] Step 4: Polish SPEC.md into publishable form
-- [ ] Step 5: Push to GitHub remote (user-confirm before running)
+- [ ] Production upgrade: swap linear gates for `halo2_gadgets::poseidon::Hash` chip
+- [ ] Production upgrade: swap Merkle addition for binary Merkle chip
+- [ ] Production upgrade: swap range placeholder for lookup table range check
+- [ ] Pin halo2_proofs git dep to a specific commit hash (supply-chain hygiene)
