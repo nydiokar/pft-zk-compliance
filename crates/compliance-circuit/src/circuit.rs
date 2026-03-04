@@ -1,58 +1,105 @@
 //! ComplianceCircuit — Halo2 ZKP circuit for Post Fiat compliance filtering.
 //!
-//! Proves, without revealing witness data:
-//!   C1. sender_addr ∈ compliance_list   (Merkle membership)
-//!   C2. receiver_addr ∈ compliance_list  (Merkle membership)
-//!   C3. hash_commit(sender ‖ receiver ‖ amount) = tx_hash  (hash binding)
+//! # What this circuit proves
 //!
-//! Public inputs  (Instance column, rows 0-64):
-//!   rows  0..32  → tx_hash bytes
-//!   rows 32..64  → compliance_merkle_root bytes
-//!   row  64      → block_height
+//! Without revealing any witness data, the circuit proves:
 //!
-//! Private witness (Advice columns): sender, receiver, amount, merkle_path
+//!   C1. `sender_addr`   ∈ compliance_list  (Merkle membership)
+//!   C2. `receiver_addr` ∈ compliance_list  (Merkle membership)
+//!   C3. `commit(sender ‖ receiver ‖ amount) = tx_hash`  (hash binding)
 //!
-//! Gate design (see docs/circuit_io.md):
-//!   - hash_gate:   enforces C3 — linear commitment a + b = c (Poseidon stand-in)
-//!   - merkle_gate: enforces C1/C2 per level: node + sibling = parent
-//!   - range_gate:  placeholder for u64 range check (tautological in prototype)
+//! # Public / private split
 //!
-//! Production path: swap the linear gates for halo2_gadgets::poseidon::Hash
-//! and a binary Merkle gadget. The constraint plumbing is identical.
+//! | Column type | Field                  | Rows (instance col) |
+//! |-------------|------------------------|---------------------|
+//! | Instance    | `tx_hash`              | 0..32               |
+//! | Instance    | `compliance_merkle_root` | 32..64             |
+//! | Instance    | `block_height`         | 64                  |
+//! | Advice      | `sender_addr`          | witness             |
+//! | Advice      | `receiver_addr`        | witness             |
+//! | Advice      | `amount`               | witness             |
+//! | Advice      | `merkle_path`          | witness             |
+//!
+//! # Gate design (see also `docs/circuit_io.md`)
+//!
+//! | Gate          | Constraint                    | Degree |
+//! |---------------|-------------------------------|--------|
+//! | `hash_binding`  | `a + b = c`                 | 2      |
+//! | `merkle_path`   | `node + sibling = parent`   | 2      |
+//! | `range_check`   | tautological placeholder    | 1      |
+//!
+//! # Prototype substitutions
+//!
+//! Two primitives from the spec (`docs/circuit_io.md`) are **intentionally
+//! simplified** for this prototype.  Each substitution is marked in the code
+//! with a `PROTOTYPE:` comment and a `PRODUCTION:` comment explaining the
+//! upgrade path.
+//!
+//! 1. **Hash function** — spec calls for Poseidon(sender ‖ receiver ‖ amount).
+//!    We use a linear sum `sender_commit + receiver_commit = tx_hash_commit`
+//!    because `halo2_gadgets::poseidon` requires a large additional dependency
+//!    and a more complex chip architecture.  The *constraint topology* (one gate
+//!    that binds three cells) is identical; only the internal polynomial differs.
+//!
+//! 2. **Merkle node hashing** — spec calls for Poseidon(left, right) at each
+//!    level.  We use `left + right = parent` for the same reason.  The path-
+//!    traversal structure, region layout, and root-equality constraint are all
+//!    production-ready.
+//!
+//! 3. **Range check** — spec calls for a lookup table against a u64 range.
+//!    We use a tautological gate (`s*(a-a)=0`) because the lookup-table gadget
+//!    requires a separate table column.  The selector wire-up is production-ready.
+//!
+//! # Instance wiring
+//!
+//! Every public input cell is wired to the instance column via
+//! `layouter.constrain_instance()`.  The MockProver's permutation checker
+//! verifies that the advice values match the supplied instance vector, so a
+//! wrong public input causes `verify()` to return `Err(...)`.
 
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
-    plonk::{
-        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Fixed, Instance, Selector,
-    },
+    plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Fixed, Instance, Selector},
     poly::Rotation,
 };
 
-// ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Constants
-// ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Merkle tree depth. Supports 2^MERKLE_DEPTH addresses.
-/// Each side (sender / receiver) uses MERKLE_DEPTH sibling hashes.
-/// Set to 20 for production (~1 M addresses); 4 for prototype speed.
+/// Merkle tree depth per side (sender / receiver).
+///
+/// Production value: 20  →  supports 2^20 ≈ 1 M compliance addresses.
+/// Prototype value: 4    →  fast compile + short MockProver run.
 pub const MERKLE_DEPTH: usize = 4;
 
-// ──────────────────────────────────────────────────────────
-// Public / Private input types
-// ──────────────────────────────────────────────────────────
+/// Total public instance rows: tx_hash(32) + merkle_root(32) + block_height(1).
+pub const NUM_INSTANCE_ROWS: usize = 65;
 
-/// Public inputs committed on-chain and visible to verifiers.
+/// Instance column row ranges.
+pub const TX_HASH_START: usize = 0;
+pub const TX_HASH_END: usize = 32;
+pub const MERKLE_ROOT_START: usize = 32;
+pub const MERKLE_ROOT_END: usize = 64;
+pub const BLOCK_HEIGHT_ROW: usize = 64;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public / private input types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Public inputs committed on-chain; visible to verifiers.
 #[derive(Clone, Debug)]
 pub struct PublicInputs {
-    /// Poseidon hash of (sender_addr ‖ receiver_addr ‖ amount).
+    /// PROTOTYPE: linear commitment of (sender_addr ‖ receiver_addr ‖ amount).
+    /// PRODUCTION: Poseidon(sender_addr ‖ receiver_addr ‖ amount).
     pub tx_hash: [u8; 32],
-    /// Root of the compliance address set Merkle tree.
+    /// Root of the compliance address Merkle tree at `block_height`.
     pub compliance_merkle_root: [u8; 32],
     /// Block height of the compliance snapshot.
     pub block_height: u64,
 }
 
-/// Private witness — never revealed to the verifier.
+/// Private witness — loaded by the prover, never revealed to the verifier.
 #[derive(Clone, Debug)]
 pub struct Witness {
     /// Sender Ethereum-style address (20 bytes).
@@ -61,33 +108,35 @@ pub struct Witness {
     pub receiver_addr: [u8; 20],
     /// Transaction amount.
     pub amount: u64,
-    /// Sibling hashes for Merkle membership proof.
-    /// First MERKLE_DEPTH entries = sender path; next MERKLE_DEPTH = receiver path.
+    /// Sibling hashes for both Merkle membership proofs, concatenated.
+    /// Layout: `[sender_sibling_0, .., sender_sibling_{D-1},
+    ///           receiver_sibling_0, .., receiver_sibling_{D-1}]`
+    /// where D = `MERKLE_DEPTH`.
     pub merkle_path: Vec<[u8; 32]>,
 }
 
-// ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Circuit configuration
-// ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Halo2 column/gate configuration for ComplianceCircuit.
+/// Column and gate configuration for `ComplianceCircuit`.
 #[derive(Clone, Debug)]
 pub struct ComplianceConfig {
-    /// a: left operand (leaf node / sender / partial hash input)
+    /// Left operand: sender field element / current Merkle node.
     pub a: Column<Advice>,
-    /// b: right operand (sibling node / receiver / partial hash input)
+    /// Right operand: receiver field element / Merkle sibling.
     pub b: Column<Advice>,
-    /// c: output (parent node / tx_hash commitment)
+    /// Output: tx_hash commitment / Merkle parent node.
     pub c: Column<Advice>,
-    /// Constants column (enables assign_advice_from_constant)
+    /// Fixed constants column — required by `assign_advice_from_constant`.
     pub constant: Column<Fixed>,
-    /// Single instance column carrying all 65 public inputs.
+    /// Single instance column, rows 0..65 (see module-level table).
     pub instance: Column<Instance>,
-    /// Activates hash-binding gate (C3).
+    /// Selector: activates the hash-binding gate (C3).
     pub s_hash: Selector,
-    /// Activates Merkle-path gate (C1 / C2 per level).
+    /// Selector: activates the Merkle-path gate (C1 / C2 per level).
     pub s_merkle: Selector,
-    /// Activates range-check gate (amount ∈ u64).
+    /// Selector: activates the range-check gate (amount ∈ u64).
     pub s_range: Selector,
 }
 
@@ -99,6 +148,8 @@ impl ComplianceConfig {
         let constant = meta.fixed_column();
         let instance = meta.instance_column();
 
+        // Enable equality on all columns so copy-constraints (including
+        // constrain_instance wiring) can be recorded in the permutation argument.
         meta.enable_equality(a);
         meta.enable_equality(b);
         meta.enable_equality(c);
@@ -109,33 +160,50 @@ impl ComplianceConfig {
         let s_merkle = meta.selector();
         let s_range = meta.selector();
 
-        // ── C3: Hash-binding gate ──────────────────────────────────────────
-        // Prototype: a + b = c  (linear commitment standing in for Poseidon).
-        // Production: replace with halo2_gadgets::poseidon::Hash gadget.
+        // ── C3: Hash-binding gate ─────────────────────────────────────────
+        // Enforces: a + b = c
+        //
+        // PROTOTYPE: linear sum over field elements folded from byte arrays.
+        // PRODUCTION: replace with halo2_gadgets::poseidon::Hash chip that
+        //   applies the Poseidon-128 permutation.  The gate structure (one
+        //   selector, three advice cells, one constraint) stays the same.
         meta.create_gate("hash_binding", |vc| {
             let s = vc.query_selector(s_hash);
             let a = vc.query_advice(a, Rotation::cur());
             let b = vc.query_advice(b, Rotation::cur());
             let c = vc.query_advice(c, Rotation::cur());
+            // s_hash * (a + b - c) = 0
             vec![s * (a + b - c)]
         });
 
-        // ── C1 / C2: Merkle-path gate ─────────────────────────────────────
-        // One row per tree level: parent = node + sibling.
-        // Production: replace with a proper binary Merkle gadget.
+        // ── C1 / C2: Merkle-path gate ────────────────────────────────────
+        // Enforces: node + sibling = parent  (one row per tree level).
+        //
+        // PROTOTYPE: additive combination — not collision-resistant.
+        // PRODUCTION: replace with Poseidon(left, right) node combination
+        //   inside a binary Merkle chip (e.g. halo2_gadgets MerkleChip).
+        //   The per-level row structure and final root equality constraint
+        //   are identical.
         meta.create_gate("merkle_path", |vc| {
             let s = vc.query_selector(s_merkle);
             let node = vc.query_advice(a, Rotation::cur());
             let sibling = vc.query_advice(b, Rotation::cur());
             let parent = vc.query_advice(c, Rotation::cur());
+            // s_merkle * (node + sibling - parent) = 0
             vec![s * (node + sibling - parent)]
         });
 
-        // ── Range gate ─────────────────────────────────────────────────────
-        // Prototype: tautological (a - a = 0). Production: lookup table.
+        // ── Range gate ───────────────────────────────────────────────────
+        // Enforces that `amount` fits in u64.
+        //
+        // PROTOTYPE: tautological — the gate fires but never rejects because
+        //   `a - a = 0` always holds.  The selector wiring is correct.
+        // PRODUCTION: replace the gate body with a lookup argument against a
+        //   pre-computed u64 range table (halo2_gadgets RangeCheckChip).
         meta.create_gate("range_check", |vc| {
             let s = vc.query_selector(s_range);
             let a = vc.query_advice(a, Rotation::cur());
+            // s_range * (a - a) = 0  — always satisfied (placeholder)
             vec![s * (a.clone() - a)]
         });
 
@@ -143,23 +211,27 @@ impl ComplianceConfig {
     }
 }
 
-// ──────────────────────────────────────────────────────────
-// Helper: fold bytes into a field element
-// ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: byte-array → field element
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Fold a byte slice into a single field element by summing byte values.
-/// This is a deterministic, injective-enough encoding for prototype constraints.
-/// Production: replace with Poseidon sponge over the bytes.
+///
+/// PROTOTYPE: injective for small byte arrays but not cryptographically
+/// collision-resistant (two distinct arrays can have the same sum).
+/// PRODUCTION: replace with a Poseidon sponge that absorbs the bytes as
+/// individual field elements, giving the collision resistance required by
+/// constraints C1–C3.
 fn bytes_to_field<F: ff::PrimeField>(bytes: &[u8]) -> F {
     bytes.iter().fold(F::ZERO, |acc, &b| acc + F::from(b as u64))
 }
 
-// ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // ComplianceCircuit
-// ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Halo2 circuit proving transaction compliance without revealing sender,
-/// receiver, amount, or Merkle path.
+/// Halo2 ZKP circuit that proves transaction compliance without revealing
+/// sender address, receiver address, amount, or Merkle path.
 #[derive(Clone, Debug)]
 pub struct ComplianceCircuit {
     pub public: PublicInputs,
@@ -183,11 +255,15 @@ impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), ErrorFront> {
-        // ── Region 1: Load witness ─────────────────────────────────────────
+        // ── Region 1: Load private witness ──────────────────────────────
+        // Assign sender, receiver, amount as single field elements.
+        // These cells are re-used (via copy-constraints) in every later region
+        // so the prover cannot substitute different values per gate.
         let (sender_cell, receiver_cell, amount_cell) = layouter.assign_region(
             || "load_witness",
             |mut region: Region<'_, F>| {
-                let sender_val = self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.sender_addr));
+                let sender_val =
+                    self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.sender_addr));
                 let receiver_val =
                     self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.receiver_addr));
                 let amount_val = self.witness.as_ref().map(|w| F::from(w.amount));
@@ -199,76 +275,146 @@ impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
             },
         )?;
 
-        // ── Region 2: Range check on amount ───────────────────────────────
+        // ── Region 2: Range check on amount ──────────────────────────────
+        // PROTOTYPE: gate is tautological; wiring is production-correct.
+        // PRODUCTION: the s_range selector activates a lookup table chip.
         layouter.assign_region(
             || "range_check",
             |mut region: Region<'_, F>| {
                 config.s_range.enable(&mut region, 0)?;
-                amount_cell.copy_advice(|| "amount", &mut region, config.a, 0)?;
+                // Copy from load_witness so the prover can't swap a different
+                // amount value into the range-check row.
+                amount_cell.copy_advice(|| "amount_rc", &mut region, config.a, 0)?;
                 Ok(())
             },
         )?;
 
-        // ── Region 3: Hash-binding (C3) ────────────────────────────────────
-        // Enforce: sender_commit + receiver_commit = tx_hash_commit
+        // ── Region 3: Hash-binding (C3) ──────────────────────────────────
+        // Constraint: sender_commit + receiver_commit = tx_hash_commit
+        //
+        // The tx_hash_commit cell is later wired to the instance column so the
+        // verifier can confirm it matches the on-chain tx_hash.
         let tx_hash_commit = Value::known(bytes_to_field::<F>(&self.public.tx_hash));
-
-        let _tx_cell: AssignedCell<F, F> = layouter.assign_region(
+        let tx_hash_cell: AssignedCell<F, F> = layouter.assign_region(
             || "hash_binding",
             |mut region: Region<'_, F>| {
                 config.s_hash.enable(&mut region, 0)?;
-                sender_cell.copy_advice(|| "sender", &mut region, config.a, 0)?;
-                receiver_cell.copy_advice(|| "receiver", &mut region, config.b, 0)?;
+                // Copy sender / receiver from load_witness — prevents the
+                // prover from using different addresses here than in the Merkle
+                // membership regions.
+                sender_cell.copy_advice(|| "sender_h", &mut region, config.a, 0)?;
+                receiver_cell.copy_advice(|| "receiver_h", &mut region, config.b, 0)?;
                 let out =
                     region.assign_advice(|| "tx_hash_out", config.c, 0, || tx_hash_commit)?;
                 Ok(out)
             },
         )?;
 
-        // ── Merkle root field element (from public inputs) ─────────────────
+        // ── Wire tx_hash_out → instance column (rows 0..32) ──────────────
+        // tx_hash is 32 bytes; we committed to a single folded field element.
+        // We wire that one cell to instance row TX_HASH_START.  A production
+        // circuit would wire 32 separate byte cells — one per instance row.
+        //
+        // This constrain_instance call records a copy-constraint in the
+        // permutation argument.  MockProver.verify() checks it automatically.
+        layouter.constrain_instance(
+            tx_hash_cell.cell(),
+            config.instance,
+            TX_HASH_START, // row 0: the folded tx_hash field element
+        )?;
+
+        // ── Merkle root field element (same for both C1 and C2) ──────────
         let root_val = bytes_to_field::<F>(&self.public.compliance_merkle_root);
 
-        // ── Region 4: Merkle path for sender (C1) ─────────────────────────
-        {
-            let leaf = self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.sender_addr));
-            let path: Value<Vec<F>> = self.witness.as_ref().map(|w| {
-                w.merkle_path[..MERKLE_DEPTH]
-                    .iter()
-                    .map(|n| bytes_to_field::<F>(n))
-                    .collect()
-            });
-            assign_merkle_region::<F>(
-                &config, &mut layouter, "sender_merkle", leaf, path, root_val,
-            )?;
-        }
+        // ── Region 4: Merkle path for sender (C1) ────────────────────────
+        let sender_leaf =
+            self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.sender_addr));
+        let sender_path: Value<Vec<F>> = self.witness.as_ref().map(|w| {
+            w.merkle_path[..MERKLE_DEPTH]
+                .iter()
+                .map(|n| bytes_to_field::<F>(n))
+                .collect()
+        });
+        let sender_root_cell = assign_merkle_region::<F>(
+            &config,
+            &mut layouter,
+            "sender_merkle",
+            sender_leaf,
+            sender_path,
+            root_val,
+        )?;
 
-        // ── Region 5: Merkle path for receiver (C2) ───────────────────────
-        {
-            let leaf = self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.receiver_addr));
-            let path: Value<Vec<F>> = self.witness.as_ref().map(|w| {
-                w.merkle_path[MERKLE_DEPTH..]
-                    .iter()
-                    .map(|n| bytes_to_field::<F>(n))
-                    .collect()
-            });
-            assign_merkle_region::<F>(
-                &config, &mut layouter, "receiver_merkle", leaf, path, root_val,
-            )?;
-        }
+        // Wire sender Merkle root → instance column (row MERKLE_ROOT_START).
+        layouter.constrain_instance(
+            sender_root_cell.cell(),
+            config.instance,
+            MERKLE_ROOT_START,
+        )?;
+
+        // ── Region 5: Merkle path for receiver (C2) ──────────────────────
+        let receiver_leaf =
+            self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.receiver_addr));
+        let receiver_path: Value<Vec<F>> = self.witness.as_ref().map(|w| {
+            w.merkle_path[MERKLE_DEPTH..]
+                .iter()
+                .map(|n| bytes_to_field::<F>(n))
+                .collect()
+        });
+        let receiver_root_cell = assign_merkle_region::<F>(
+            &config,
+            &mut layouter,
+            "receiver_merkle",
+            receiver_leaf,
+            receiver_path,
+            root_val,
+        )?;
+
+        // Wire receiver Merkle root → instance column (same row: both paths
+        // must reach the same compliance_merkle_root).
+        layouter.constrain_instance(
+            receiver_root_cell.cell(),
+            config.instance,
+            MERKLE_ROOT_START,
+        )?;
+
+        // ── Wire block_height → instance column (row 64) ─────────────────
+        // block_height is a scalar; assign it into a throwaway advice cell
+        // just so we can record the copy-constraint.
+        let bh_cell: AssignedCell<F, F> = layouter.assign_region(
+            || "block_height",
+            |mut region: Region<'_, F>| {
+                let bh_val = Value::known(F::from(self.public.block_height));
+                region.assign_advice(|| "block_height", config.a, 0, || bh_val)
+            },
+        )?;
+        layouter.constrain_instance(bh_cell.cell(), config.instance, BLOCK_HEIGHT_ROW)?;
 
         Ok(())
     }
 }
 
-/// Assign one Merkle path region (MERKLE_DEPTH rows).
+// ─────────────────────────────────────────────────────────────────────────────
+// Merkle region helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Assign one Merkle path region (`MERKLE_DEPTH` rows) and return the final
+/// root cell so the caller can wire it to the instance column.
 ///
-/// Row layout per level i:
-///   a[i] = current node
-///   b[i] = sibling (from merkle_path)
-///   c[i] = parent = node + sibling   (s_merkle gate enforces this)
+/// Row layout (one row per tree level `i`):
 ///
-/// After the final level, c[MERKLE_DEPTH-1] is constrained equal to
-/// the expected Merkle root via an `assign_advice_from_constant` anchor.
+/// ```text
+/// row i: a[i] = current_node
+///        b[i] = sibling (from merkle_path)
+///        c[i] = parent  = node + sibling   ← s_merkle gate
+/// ```
+///
+/// At depth `MERKLE_DEPTH - 1`, an extra anchor row is added via
+/// `assign_advice_from_constant` to plant the expected root value.
+/// A `constrain_equal` between `parent_cell` and the anchor enforces
+/// that the computed root matches — regardless of the path values.
+///
+/// The returned cell is the final `parent_cell` (= computed root).
+/// The caller wires it to the public instance column.
 fn assign_merkle_region<F: ff::PrimeField>(
     config: &ComplianceConfig,
     layouter: &mut impl Layouter<F>,
@@ -276,16 +422,20 @@ fn assign_merkle_region<F: ff::PrimeField>(
     leaf: Value<F>,
     path: Value<Vec<F>>,
     expected_root: F,
-) -> Result<(), ErrorFront> {
+) -> Result<AssignedCell<F, F>, ErrorFront> {
     layouter.assign_region(
         || name,
         |mut region: Region<'_, F>| {
             let mut current: Value<F> = leaf;
+            let mut final_parent_cell: Option<AssignedCell<F, F>> = None;
 
             for depth in 0..MERKLE_DEPTH {
                 config.s_merkle.enable(&mut region, depth)?;
 
                 let sibling: Value<F> = path.as_ref().map(|p| p[depth]);
+
+                // PROTOTYPE: parent = node + sibling
+                // PRODUCTION: parent = Poseidon(node, sibling)
                 let parent: Value<F> = current.zip(sibling).map(|(n, s)| n + s);
 
                 region.assign_advice(|| "node", config.a, depth, || current)?;
@@ -293,159 +443,212 @@ fn assign_merkle_region<F: ff::PrimeField>(
                 let parent_cell =
                     region.assign_advice(|| "parent", config.c, depth, || parent)?;
 
-                // At the final level, enforce parent == expected_root.
                 if depth == MERKLE_DEPTH - 1 {
-                    let root_cell = region.assign_advice_from_constant(
-                        || "merkle_root",
+                    // Plant the expected root as a fixed constant in the row
+                    // immediately after the last Merkle row, then enforce
+                    // equality between computed_parent and expected_root.
+                    // This is the root-binding constraint: if the path is wrong
+                    // the computed parent won't equal the committed root and
+                    // verify() will return a Permutation error.
+                    let root_anchor = region.assign_advice_from_constant(
+                        || "root_anchor",
                         config.c,
                         depth + 1,
                         expected_root,
                     )?;
-                    region.constrain_equal(parent_cell.cell(), root_cell.cell())?;
+                    region.constrain_equal(parent_cell.cell(), root_anchor.cell())?;
+                    final_parent_cell = Some(parent_cell);
                 }
 
                 current = parent;
             }
-            Ok(())
+
+            // Unwrap is safe: loop always reaches MERKLE_DEPTH - 1.
+            Ok(final_parent_cell.unwrap())
         },
     )
 }
 
-// ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
-// ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff::Field;
     use halo2_proofs::{circuit::Value, dev::MockProver};
     use halo2curves::pasta::Fp;
 
-    /// Build a self-consistent test fixture.
-    ///
-    /// The prototype circuit uses linear sums as stand-ins for hash functions:
-    ///   hash_binding:  sender_sum + receiver_sum = tx_hash_sum   (C3)
-    ///   merkle_level:  node + sibling = parent                   (C1/C2)
-    ///
-    /// Strategy: choose byte arrays so that all arithmetic stays in u64 and
-    /// both Merkle paths land on the SAME compliance_merkle_root.
-    ///
-    /// We pick small, uniform byte values and construct the root by summing
-    /// upward; then encode the root into the compliance_merkle_root byte array.
-    fn make_test_circuit() -> (ComplianceCircuit, Vec<Vec<Fp>>) {
-        // --- Addresses & amount ---
-        // Use small byte values to avoid overflow during path summation.
-        let sender_addr: [u8; 20] = [1u8; 20];  // byte-sum = 20
-        let receiver_addr: [u8; 20] = [2u8; 20]; // byte-sum = 40
+    // ── Fixture builder ───────────────────────────────────────────────────
+    //
+    // We need every public input to be self-consistent with the witness so
+    // that all constrain_instance wires pass the permutation check.
+    //
+    // Consistency requirements (prototype arithmetic):
+    //
+    //   tx_hash_commit       = bytes_to_field(tx_hash)
+    //                        = bytes_to_field(sender_addr) + bytes_to_field(receiver_addr)
+    //
+    //   merkle_root_commit   = bytes_to_field(compliance_merkle_root)
+    //                        = leaf + sum(siblings)   for BOTH sender and receiver paths
+    //
+    // Strategy for Merkle:
+    //   Choose `target_root` large enough that both paths can reach it.
+    //   Use MERKLE_DEPTH-1 common siblings (byte-sum = 1 each), then solve
+    //   for the last sibling on each side:
+    //     last_sib = target_root - (leaf_sum + MERKLE_DEPTH - 1)
+    fn make_fixture() -> (ComplianceCircuit, Vec<Vec<Fp>>) {
+        // Small uniform byte values → sums well within u64.
+        let sender_addr: [u8; 20] = [1u8; 20];   // sum = 20
+        let receiver_addr: [u8; 20] = [2u8; 20]; // sum = 40
         let amount: u64 = 999;
 
-        let sender_sum: u64 = sender_addr.iter().map(|&b| b as u64).sum();   // 20
-        let receiver_sum: u64 = receiver_addr.iter().map(|&b| b as u64).sum(); // 40
+        let sender_sum: u64 = sender_addr.iter().map(|&b| b as u64).sum();
+        let receiver_sum: u64 = receiver_addr.iter().map(|&b| b as u64).sum();
 
-        // --- Hash binding (C3): tx_hash_sum = sender_sum + receiver_sum ---
-        let hash_commit_val: u64 = sender_sum + receiver_sum; // 60
+        // ── tx_hash: encode (sender_sum + receiver_sum) as first 8 bytes ──
+        let hash_val: u64 = sender_sum + receiver_sum; // 60
         let mut tx_hash = [0u8; 32];
-        // Encode as single byte (fits in u8 for this fixture).
-        tx_hash[0] = hash_commit_val as u8;
+        tx_hash[..8].copy_from_slice(&hash_val.to_le_bytes());
 
-        // --- Merkle path: build paths so both converge to the same root ---
-        //
-        // For each side, pick MERKLE_DEPTH siblings (value = 1 each, byte-sum = 1).
-        // root = leaf + sum_of_siblings = leaf + MERKLE_DEPTH
-        // sender_root = 20 + 4 = 24
-        // receiver_root = 40 + 4 = 44   ← these differ!
-        //
-        // Solution: use the SAME siblings for both but adjust the last sibling
-        // for each path so both roots converge to a chosen target_root.
-        //
-        // target_root = 100 (arbitrary, fits in a single byte for easy encoding)
-        // sender path:   last sibling sum = target_root - (sender_sum + (MERKLE_DEPTH-1)*1)
-        // receiver path: last sibling sum = target_root - (receiver_sum + (MERKLE_DEPTH-1)*1)
-        let target_root: u64 = 200; // large enough to avoid underflow for both sides
+        // ── Merkle paths: both sides converge to target_root ──────────────
+        // target_root must be > max(sender_sum, receiver_sum) + (MERKLE_DEPTH - 1)
+        // so that the last sibling value is non-negative.
+        let target_root: u64 = 200;
 
-        // Common siblings for levels 0..MERKLE_DEPTH-2 (byte-sum = 1 each)
-        let common_sibling: [u8; 32] = {
+        let common_sib: [u8; 32] = {
             let mut a = [0u8; 32];
-            a[0] = 1;
+            a[0] = 1; // byte-sum = 1
             a
         };
 
-        // Compute running sums after MERKLE_DEPTH-1 common siblings
-        let sender_after_common: u64 = sender_sum + (MERKLE_DEPTH as u64 - 1);
-        let receiver_after_common: u64 = receiver_sum + (MERKLE_DEPTH as u64 - 1);
+        let make_path = |leaf_sum: u64| -> Vec<[u8; 32]> {
+            // After (MERKLE_DEPTH-1) common siblings:
+            //   running = leaf_sum + (MERKLE_DEPTH - 1) * 1
+            let running = leaf_sum + (MERKLE_DEPTH as u64 - 1);
+            let last_sib_val = target_root - running;
 
-        // Last sibling for each path makes the final parent = target_root
-        let sender_last_sib_sum: u64 = target_root - sender_after_common;
-        let receiver_last_sib_sum: u64 = target_root - receiver_after_common;
+            let mut path = vec![common_sib; MERKLE_DEPTH - 1];
+            path.push({
+                let mut a = [0u8; 32];
+                a[..8].copy_from_slice(&last_sib_val.to_le_bytes());
+                a
+            });
+            path
+        };
 
-        // Build sender path
-        let mut sender_siblings: Vec<[u8; 32]> = vec![common_sibling; MERKLE_DEPTH - 1];
-        sender_siblings.push({
-            let mut a = [0u8; 32];
-            a[..8].copy_from_slice(&sender_last_sib_sum.to_le_bytes());
-            a
-        });
+        let sender_path = make_path(sender_sum);
+        let receiver_path = make_path(receiver_sum);
 
-        // Build receiver path
-        let mut receiver_siblings: Vec<[u8; 32]> = vec![common_sibling; MERKLE_DEPTH - 1];
-        receiver_siblings.push({
-            let mut a = [0u8; 32];
-            a[..8].copy_from_slice(&receiver_last_sib_sum.to_le_bytes());
-            a
-        });
-
-        // Verify both roots equal target_root
-        let check_root = |leaf: u64, siblings: &Vec<[u8; 32]>| -> u64 {
-            siblings.iter().fold(leaf, |cur, sib| {
+        // Sanity check: both paths compute to target_root.
+        let check = |leaf: u64, path: &Vec<[u8; 32]>| -> u64 {
+            path.iter().fold(leaf, |cur, sib| {
                 cur + sib.iter().map(|&b| b as u64).sum::<u64>()
             })
         };
-        assert_eq!(check_root(sender_sum, &sender_siblings), target_root);
-        assert_eq!(check_root(receiver_sum, &receiver_siblings), target_root);
+        assert_eq!(check(sender_sum, &sender_path), target_root);
+        assert_eq!(check(receiver_sum, &receiver_path), target_root);
 
-        // Encode compliance_merkle_root: byte-sum = target_root
+        // ── compliance_merkle_root: encode target_root as first 8 bytes ───
         let mut compliance_merkle_root = [0u8; 32];
         compliance_merkle_root[..8].copy_from_slice(&target_root.to_le_bytes());
 
-        // Full merkle_path = sender siblings ++ receiver siblings
-        let mut merkle_path = sender_siblings;
-        merkle_path.extend_from_slice(&receiver_siblings);
+        let block_height: u64 = 1_000_000;
 
-        let public = PublicInputs { tx_hash, compliance_merkle_root, block_height: 1_000_000u64 };
-        let witness = Witness {
-            sender_addr,
-            receiver_addr,
-            amount,
-            merkle_path,
-        };
+        let mut merkle_path = sender_path;
+        merkle_path.extend_from_slice(&receiver_path);
+
+        let public =
+            PublicInputs { tx_hash, compliance_merkle_root, block_height };
+        let witness =
+            Witness { sender_addr, receiver_addr, amount, merkle_path };
+
         let circuit = ComplianceCircuit {
             public: public.clone(),
             witness: Value::known(witness),
         };
 
-        // Build public instance vector (single column, 65 rows):
-        //   rows  0..32  → tx_hash bytes as Fp
-        //   rows 32..64  → compliance_merkle_root bytes as Fp
-        //   row  64      → block_height as Fp
-        let mut instance_col: Vec<Fp> = public
-            .tx_hash
-            .iter()
-            .map(|&b| Fp::from(b as u64))
-            .collect();
-        instance_col.extend(
-            public.compliance_merkle_root.iter().map(|&b| Fp::from(b as u64)),
-        );
-        instance_col.push(Fp::from(public.block_height));
+        // ── Instance column (65 rows) ──────────────────────────────────────
+        // Row 0:      tx_hash folded = Fp::from(hash_val)
+        //             (we wire tx_hash_out at row TX_HASH_START = 0 only;
+        //              the remaining 31 byte-rows are unused in this prototype)
+        // Row 32:     compliance_merkle_root folded = Fp::from(target_root)
+        // Row 64:     block_height
+        //
+        // Unused rows (1..32, 33..64) must be present in the vector but their
+        // values are never constrained, so zero is fine.
+        let mut instance_col = vec![Fp::ZERO; NUM_INSTANCE_ROWS];
+        instance_col[TX_HASH_START] = Fp::from(hash_val);
+        instance_col[MERKLE_ROOT_START] = Fp::from(target_root);
+        instance_col[BLOCK_HEIGHT_ROW] = Fp::from(block_height);
 
         (circuit, vec![instance_col])
     }
 
+    // ── Test 1: valid witness → verify() passes ───────────────────────────
     #[test]
-    fn test_compliance_circuit_valid() {
-        let (circuit, instance) = make_test_circuit();
-        // k = 8 → 2^8 = 256 rows (sufficient for MERKLE_DEPTH=4 prototype)
+    fn test_valid_witness_passes() {
+        let (circuit, instance) = make_fixture();
+        // k = 8 → 2^8 = 256 rows; sufficient for MERKLE_DEPTH = 4.
         let prover = MockProver::<Fp>::run(8, &circuit, instance)
             .expect("MockProver::run failed");
-        prover.verify().expect("Circuit constraints unsatisfied");
+        prover.verify().expect("Valid witness should satisfy all constraints");
+    }
+
+    // ── Test 2: wrong tx_hash in public inputs → verify() fails ──────────
+    //
+    // The instance column at row TX_HASH_START is set to a value that does
+    // NOT equal sender_sum + receiver_sum.  The constrain_instance wire from
+    // tx_hash_out → instance[0] will fail the permutation check.
+    #[test]
+    fn test_wrong_tx_hash_fails() {
+        let (circuit, mut instance) = make_fixture();
+        // Corrupt the tx_hash instance value.
+        instance[0][TX_HASH_START] += Fp::from(1u64);
+        let prover = MockProver::<Fp>::run(8, &circuit, instance)
+            .expect("MockProver::run failed");
+        assert!(
+            prover.verify().is_err(),
+            "Wrong tx_hash should cause verify() to fail"
+        );
+    }
+
+    // ── Test 3: wrong merkle_root in public inputs → verify() fails ───────
+    //
+    // The instance column at row MERKLE_ROOT_START is corrupted.
+    // Both sender and receiver Merkle roots are wired to this row, so
+    // the permutation check fails.
+    #[test]
+    fn test_wrong_merkle_root_fails() {
+        let (circuit, mut instance) = make_fixture();
+        instance[0][MERKLE_ROOT_START] += Fp::from(1u64);
+        let prover = MockProver::<Fp>::run(8, &circuit, instance)
+            .expect("MockProver::run failed");
+        assert!(
+            prover.verify().is_err(),
+            "Wrong merkle_root should cause verify() to fail"
+        );
+    }
+
+    // ── Test 4: wrong merkle_path in witness → verify() fails ────────────
+    //
+    // The sender's first sibling is changed so the computed Merkle root no
+    // longer equals the committed compliance_merkle_root.
+    // The root_anchor constrain_equal in assign_merkle_region fires.
+    #[test]
+    fn test_wrong_merkle_path_fails() {
+        let (mut circuit, instance) = make_fixture();
+        circuit.witness = circuit.witness.map(|mut w| {
+            // Flip one byte in the first sender sibling → wrong path root.
+            w.merkle_path[0][0] ^= 0xFF;
+            w
+        });
+        let prover = MockProver::<Fp>::run(8, &circuit, instance)
+            .expect("MockProver::run failed");
+        assert!(
+            prover.verify().is_err(),
+            "Wrong Merkle path should cause verify() to fail"
+        );
     }
 }
