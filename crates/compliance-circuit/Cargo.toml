@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2" }
+ff = "0.13"
 
 [dev-dependencies]
 rand = "0.8"
+halo2curves = "0.7"
