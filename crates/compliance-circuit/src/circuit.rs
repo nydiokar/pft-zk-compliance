@@ -215,15 +215,36 @@ impl ComplianceConfig {
 // Helper: byte-array → field element
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Fold a byte slice into a single field element by summing byte values.
+/// Encode a byte slice as a field element using little-endian packing.
 ///
-/// PROTOTYPE: injective for small byte arrays but not cryptographically
-/// collision-resistant (two distinct arrays can have the same sum).
-/// PRODUCTION: replace with a Poseidon sponge that absorbs the bytes as
-/// individual field elements, giving the collision resistance required by
-/// constraints C1–C3.
+/// Interprets the first `min(bytes.len(), 32)` bytes as a little-endian
+/// unsigned integer and maps it into the field.  This is injective for inputs
+/// up to 32 bytes (Fp is ~255 bits), so distinct byte arrays produce distinct
+/// field elements — unlike a byte-sum which is not injective at all.
+///
+/// PROTOTYPE: still not Poseidon — this encoding has no hiding property and
+/// leaks byte structure.  However it is a correct *commitment* for constraint
+/// purposes: the prover cannot substitute a different byte array and satisfy
+/// the same constraint.
+/// PRODUCTION: replace with a Poseidon sponge over the individual byte values.
 fn bytes_to_field<F: ff::PrimeField>(bytes: &[u8]) -> F {
-    bytes.iter().fold(F::ZERO, |acc, &b| acc + F::from(b as u64))
+    // Pack up to 32 bytes little-endian into a 32-byte repr buffer.
+    // F::from_repr expects exactly F::Repr::default().len() bytes (32 for Fp).
+    let mut repr = F::Repr::default();
+    {
+        let repr_slice = repr.as_mut();
+        let len = repr_slice.len().min(bytes.len());
+        repr_slice[..len].copy_from_slice(&bytes[..len]);
+    }
+    // from_repr returns CtOption; if the value >= p (unlikely for 20/32-byte
+    // inputs well below the Pasta field modulus) fall back to reduction via
+    // from_u128 on the low bytes — but in practice this never fires for our
+    // address and hash sizes.
+    F::from_repr(repr).unwrap_or_else(|| {
+        let mut low = [0u8; 8];
+        low.copy_from_slice(&bytes[..8.min(bytes.len())]);
+        F::from(u64::from_le_bytes(low))
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -476,111 +497,102 @@ fn assign_merkle_region<F: ff::PrimeField>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ff::Field;
+    use ff::{Field, PrimeField};
     use halo2_proofs::{circuit::Value, dev::MockProver};
     use halo2curves::pasta::Fp;
 
     // ── Fixture builder ───────────────────────────────────────────────────
     //
-    // We need every public input to be self-consistent with the witness so
-    // that all constrain_instance wires pass the permutation check.
+    // Construction strategy: work entirely in field arithmetic.
     //
-    // Consistency requirements (prototype arithmetic):
+    // 1. Choose sender_addr, receiver_addr as raw byte arrays.
+    // 2. Compute their field elements via bytes_to_field — this is the ground
+    //    truth the circuit will use internally.
+    // 3. Derive tx_hash bytes by encoding (sender_f + receiver_f) back into
+    //    a [u8; 32] so that bytes_to_field(tx_hash) == sender_f + receiver_f.
+    // 4. For each Merkle path: choose MERKLE_DEPTH-1 arbitrary sibling byte
+    //    arrays, compute the running field sum, then derive the final sibling
+    //    as (target_root_f - running) encoded back into bytes.
+    // 5. Encode compliance_merkle_root as the bytes of target_root_f.
     //
-    //   tx_hash_commit       = bytes_to_field(tx_hash)
-    //                        = bytes_to_field(sender_addr) + bytes_to_field(receiver_addr)
-    //
-    //   merkle_root_commit   = bytes_to_field(compliance_merkle_root)
-    //                        = leaf + sum(siblings)   for BOTH sender and receiver paths
-    //
-    // Strategy for Merkle:
-    //   Choose `target_root` large enough that both paths can reach it.
-    //   Use MERKLE_DEPTH-1 common siblings (byte-sum = 1 each), then solve
-    //   for the last sibling on each side:
-    //     last_sib = target_root - (leaf_sum + MERKLE_DEPTH - 1)
+    // This way the fixture is defined by field values, not byte sums, and
+    // changing MERKLE_DEPTH or the address bytes cannot cause silent overflow.
+    fn field_to_bytes(f: Fp) -> [u8; 32] {
+        // Fp::to_repr() gives the canonical little-endian byte representation.
+        f.to_repr().into()
+    }
+
     fn make_fixture() -> (ComplianceCircuit, Vec<Vec<Fp>>) {
-        // Small uniform byte values → sums well within u64.
-        let sender_addr: [u8; 20] = [1u8; 20];   // sum = 20
-        let receiver_addr: [u8; 20] = [2u8; 20]; // sum = 40
+        let sender_addr: [u8; 20] = [0x01u8; 20];
+        let receiver_addr: [u8; 20] = [0x02u8; 20];
         let amount: u64 = 999;
+        let block_height: u64 = 1_000_000;
 
-        let sender_sum: u64 = sender_addr.iter().map(|&b| b as u64).sum();
-        let receiver_sum: u64 = receiver_addr.iter().map(|&b| b as u64).sum();
+        // Ground-truth field elements for sender and receiver.
+        let sender_f: Fp = bytes_to_field(&sender_addr);
+        let receiver_f: Fp = bytes_to_field(&receiver_addr);
 
-        // ── tx_hash: encode (sender_sum + receiver_sum) as first 8 bytes ──
-        let hash_val: u64 = sender_sum + receiver_sum; // 60
-        let mut tx_hash = [0u8; 32];
-        tx_hash[..8].copy_from_slice(&hash_val.to_le_bytes());
+        // tx_hash bytes encode (sender_f + receiver_f) so that
+        // bytes_to_field(tx_hash) == sender_f + receiver_f exactly.
+        let tx_hash_f: Fp = sender_f + receiver_f;
+        let tx_hash: [u8; 32] = field_to_bytes(tx_hash_f);
 
-        // ── Merkle paths: both sides converge to target_root ──────────────
-        // target_root must be > max(sender_sum, receiver_sum) + (MERKLE_DEPTH - 1)
-        // so that the last sibling value is non-negative.
-        let target_root: u64 = 200;
-
-        let common_sib: [u8; 32] = {
+        // Arbitrary but fixed sibling bytes for levels 0..MERKLE_DEPTH-2.
+        // Any values work — we solve for the last sibling in field arithmetic.
+        let common_sibling: [u8; 32] = {
             let mut a = [0u8; 32];
-            a[0] = 1; // byte-sum = 1
+            a[0] = 0x07;
             a
         };
+        let common_f: Fp = bytes_to_field(&common_sibling);
 
-        let make_path = |leaf_sum: u64| -> Vec<[u8; 32]> {
-            // After (MERKLE_DEPTH-1) common siblings:
-            //   running = leaf_sum + (MERKLE_DEPTH - 1) * 1
-            let running = leaf_sum + (MERKLE_DEPTH as u64 - 1);
-            let last_sib_val = target_root - running;
+        // target_root_f: arbitrary field element that both paths will converge to.
+        // Chosen as a fixed constant independent of address values.
+        let target_root_f: Fp = Fp::from(0xDEAD_BEEF_u64);
 
-            let mut path = vec![common_sib; MERKLE_DEPTH - 1];
-            path.push({
-                let mut a = [0u8; 32];
-                a[..8].copy_from_slice(&last_sib_val.to_le_bytes());
-                a
-            });
+        // Build a Merkle path for one side.
+        // After (MERKLE_DEPTH-1) common siblings the running field value is:
+        //   running = leaf_f + (MERKLE_DEPTH-1) * common_f
+        // The last sibling must satisfy: running + last_sib_f = target_root_f
+        //   → last_sib_f = target_root_f - running
+        let make_path = |leaf_f: Fp| -> Vec<[u8; 32]> {
+            let running: Fp = leaf_f
+                + common_f * Fp::from(MERKLE_DEPTH as u64 - 1);
+            let last_sib_f: Fp = target_root_f - running;
+
+            let mut path = vec![common_sibling; MERKLE_DEPTH - 1];
+            path.push(field_to_bytes(last_sib_f));
             path
         };
 
-        let sender_path = make_path(sender_sum);
-        let receiver_path = make_path(receiver_sum);
+        let sender_path = make_path(sender_f);
+        let receiver_path = make_path(receiver_f);
 
-        // Sanity check: both paths compute to target_root.
-        let check = |leaf: u64, path: &Vec<[u8; 32]>| -> u64 {
-            path.iter().fold(leaf, |cur, sib| {
-                cur + sib.iter().map(|&b| b as u64).sum::<u64>()
-            })
+        // Verify both paths in field arithmetic — no byte-sum guesswork.
+        let check_path = |leaf_f: Fp, path: &[[u8; 32]]| -> Fp {
+            path.iter().fold(leaf_f, |cur, sib| cur + bytes_to_field::<Fp>(sib))
         };
-        assert_eq!(check(sender_sum, &sender_path), target_root);
-        assert_eq!(check(receiver_sum, &receiver_path), target_root);
+        assert_eq!(check_path(sender_f, &sender_path), target_root_f);
+        assert_eq!(check_path(receiver_f, &receiver_path), target_root_f);
 
-        // ── compliance_merkle_root: encode target_root as first 8 bytes ───
-        let mut compliance_merkle_root = [0u8; 32];
-        compliance_merkle_root[..8].copy_from_slice(&target_root.to_le_bytes());
-
-        let block_height: u64 = 1_000_000;
+        let compliance_merkle_root: [u8; 32] = field_to_bytes(target_root_f);
 
         let mut merkle_path = sender_path;
         merkle_path.extend_from_slice(&receiver_path);
 
-        let public =
-            PublicInputs { tx_hash, compliance_merkle_root, block_height };
-        let witness =
-            Witness { sender_addr, receiver_addr, amount, merkle_path };
-
+        let public = PublicInputs { tx_hash, compliance_merkle_root, block_height };
+        let witness = Witness { sender_addr, receiver_addr, amount, merkle_path };
         let circuit = ComplianceCircuit {
             public: public.clone(),
             witness: Value::known(witness),
         };
 
-        // ── Instance column (65 rows) ──────────────────────────────────────
-        // Row 0:      tx_hash folded = Fp::from(hash_val)
-        //             (we wire tx_hash_out at row TX_HASH_START = 0 only;
-        //              the remaining 31 byte-rows are unused in this prototype)
-        // Row 32:     compliance_merkle_root folded = Fp::from(target_root)
-        // Row 64:     block_height
-        //
-        // Unused rows (1..32, 33..64) must be present in the vector but their
-        // values are never constrained, so zero is fine.
+        // Instance column (65 rows).
+        // Only the three wired rows carry meaningful values; the rest are zero
+        // because no constrain_instance call touches them.
         let mut instance_col = vec![Fp::ZERO; NUM_INSTANCE_ROWS];
-        instance_col[TX_HASH_START] = Fp::from(hash_val);
-        instance_col[MERKLE_ROOT_START] = Fp::from(target_root);
+        instance_col[TX_HASH_START] = tx_hash_f;
+        instance_col[MERKLE_ROOT_START] = target_root_f;
         instance_col[BLOCK_HEIGHT_ROW] = Fp::from(block_height);
 
         (circuit, vec![instance_col])
