@@ -2,7 +2,7 @@
 
 **Project:** Post Fiat Validator Stack — ZK Compliance Layer (Design Proposal)
 **Date:** 2026-03-04
-**Status:** v1.0 — Design Proposal
+**Status:** v1.1 — Design Proposal
 **Audience:** L1 engineers working on postfiatd (the Post Fiat rippled fork)
 
 > **Scope note:** This is an architecture *proposal* for a ZK compliance layer
@@ -15,6 +15,13 @@
 > consensus logic. Implementation would be iterative: this spec defines the
 > interface contract so the sidecar can be built and tested independently before
 > any postfiatd changes are required.
+>
+> **v1.1 changes:** Circuit inputs updated to use XRPL ed25519 sender pubkeys
+> (not Ethereum-style addresses). Compliance oracle signature added as a private
+> witness input — the Post Fiat LLM-based OFAC oracle signs off on pubkeys, and
+> the ZK circuit proves possession of a valid oracle signature without revealing
+> which entity was screened. Proof propagation flow across the validator network
+> added in §3.5.
 
 ---
 
@@ -27,6 +34,7 @@
 5. [Security Analysis](#5-security-analysis)
 6. [Performance Budget](#6-performance-budget)
 7. [Deployment Guide](#7-deployment-guide)
+8. [References](#references)
 
 ---
 
@@ -88,11 +96,16 @@ the proof to a specific transaction and a specific compliance snapshot.
 
 | Field | Type | Halo2 cells | Description |
 |---|---|---|---|
-| `tx_hash` | `[u8; 32]` | 32 × `Instance` | Poseidon hash of `(sender_addr ‖ receiver_addr ‖ amount)` |
-| `compliance_merkle_root` | `[u8; 32]` | 32 × `Instance` | Root of the compliance address Merkle tree at `block_height` |
+| `tx_hash` | `[u8; 32]` | 32 × `Instance` | Poseidon hash of `(sender_pubkey ‖ receiver_pubkey ‖ amount)` |
+| `compliance_merkle_root` | `[u8; 32]` | 32 × `Instance` | Root of the oracle-signed compliance pubkey Merkle tree at `block_height` |
+| `oracle_pubkey_hash` | `[u8; 32]` | 32 × `Instance` | Poseidon hash of the compliance oracle's ed25519 public key |
 | `block_height` | `u64` | 1 × `Instance` | Block at which the compliance snapshot was taken |
 
-Total public instance cells: **65**
+Total public instance cells: **97**
+
+`oracle_pubkey_hash` anchors the proof to a specific oracle identity without
+revealing which keys the oracle signed. Rotating the oracle key produces a
+new `oracle_pubkey_hash`, invalidating all old proofs automatically.
 
 ### 2.2 Private Inputs (Witness / Advice Columns)
 
@@ -101,53 +114,74 @@ They constitute the zero-knowledge witness.
 
 | Field | Type | Description |
 |---|---|---|
-| `sender_addr` | `[u8; 20]` | Sender Ethereum-style address |
-| `receiver_addr` | `[u8; 20]` | Receiver address |
-| `amount` | `u64` | Transaction amount |
-| `merkle_path` | `Vec<[u8; 32]>` | Sibling hashes for Merkle membership proof (depth 20 = 640 bytes) |
+| `sender_pubkey` | `[u8; 32]` | Sender XRPL ed25519 public key (32 bytes) |
+| `receiver_pubkey` | `[u8; 32]` | Receiver XRPL ed25519 public key |
+| `amount` | `u64` | Transaction amount in drops |
+| `sender_oracle_sig` | `[u8; 64]` | Ed25519 signature from compliance oracle over `Poseidon(sender_pubkey)` |
+| `receiver_oracle_sig` | `[u8; 64]` | Ed25519 signature from compliance oracle over `Poseidon(receiver_pubkey)` |
+| `merkle_path` | `Vec<[u8; 32]>` | Sibling hashes confirming oracle-signed pubkeys are in the compliance tree (depth 20) |
 
-Merkle tree depth 20 supports up to **~1M compliance addresses**.
+**Oracle signature model:** The Post Fiat compliance oracle (currently the
+LLM-based OFAC screener) signs each pubkey it has cleared: `sig = oracle_sign(Poseidon(pubkey))`.
+The ZK circuit proves the prover holds valid oracle signatures for both sender
+and receiver — without revealing the pubkeys, the signatures, or the Merkle path
+to any verifier.
+
+Merkle tree depth 20 supports up to **~1M cleared pubkeys**.
 
 ### 2.3 Circuit Constraints
 
-The circuit enforces three constraints simultaneously:
+The circuit enforces four constraints simultaneously:
 
-**C1 — Sender membership:**
+**C1 — Sender oracle signature valid:**
 ```
-MerkleVerify(
-    root  = compliance_merkle_root,
-    leaf  = Poseidon(sender_addr),
-    path  = merkle_path[0..depth]
+Ed25519Verify(
+    pk  = oracle_pubkey,
+    msg = Poseidon(sender_pubkey),
+    sig = sender_oracle_sig
 ) = 1
 ```
 
-**C2 — Receiver membership:**
+**C2 — Receiver oracle signature valid:**
 ```
-MerkleVerify(
-    root  = compliance_merkle_root,
-    leaf  = Poseidon(receiver_addr),
-    path  = merkle_path[0..depth]
+Ed25519Verify(
+    pk  = oracle_pubkey,
+    msg = Poseidon(receiver_pubkey),
+    sig = receiver_oracle_sig
 ) = 1
 ```
 
-**C3 — Transaction hash binding:**
+**C3 — Both pubkeys present in compliance Merkle tree:**
 ```
-Poseidon(sender_addr ‖ receiver_addr ‖ amount) = tx_hash
+MerkleVerify(
+    root = compliance_merkle_root,
+    leaf = Poseidon(sender_pubkey ‖ receiver_pubkey),
+    path = merkle_path[0..depth]
+) = 1
 ```
 
-C3 is critical: it prevents a prover from substituting compliant addresses for
-the actual non-compliant sender/receiver while reusing a valid `tx_hash`.
+**C4 — Transaction hash binding:**
+```
+Poseidon(sender_pubkey ‖ receiver_pubkey ‖ amount) = tx_hash
+```
+
+C4 prevents reusing a valid proof for a different transaction.
+C1+C2 ensure the oracle actually cleared both parties — Merkle membership
+alone (C3) is insufficient because the Merkle tree could be stale; the oracle
+signature carries a freshness guarantee via oracle key rotation.
 
 ### 2.4 Gate Architecture
 
-| Gate | Constraint | Max degree |
+| Gate | Constraints | Max degree |
 |---|---|---|
-| Poseidon hash gate | C3 hash binding | 3 |
-| Merkle path gate | C1 and C2 membership (one level per row) | 4 |
-| Range check (lookup) | `amount` fits in u64; path elements are 32-byte field elements | 2 |
+| Poseidon hash gate | C3 leaf hash, C4 tx binding | 3 |
+| Ed25519 verify gate | C1, C2 oracle sig verification | 5 |
+| Merkle path gate | C3 membership (one level per row) | 4 |
+| Range check (lookup) | `amount` fits in u64 | 2 |
 
-Target maximum gate degree: **4** (leaves headroom under the PLONK degree bound
-of 8 used by the PSE fork).
+Target maximum gate degree: **5** (within the PLONK degree bound of 8).
+Ed25519 in-circuit is the most expensive gate — its degree-5 constraint is
+dominated by the scalar multiplication check.
 
 ### 2.5 Rust Struct Layout
 
@@ -156,13 +190,16 @@ pub struct ComplianceCircuit {
     // Public — committed on-chain
     pub tx_hash:                [u8; 32],
     pub compliance_merkle_root: [u8; 32],
+    pub oracle_pubkey_hash:     [u8; 32],
     pub block_height:           u64,
 
     // Private — witness only
-    pub sender_addr:   Value<[u8; 20]>,
-    pub receiver_addr: Value<[u8; 20]>,
-    pub amount:        Value<u64>,
-    pub merkle_path:   Value<Vec<[u8; 32]>>,
+    pub sender_pubkey:      Value<[u8; 32]>,
+    pub receiver_pubkey:    Value<[u8; 32]>,
+    pub amount:             Value<u64>,
+    pub sender_oracle_sig:  Value<[u8; 64]>,
+    pub receiver_oracle_sig: Value<[u8; 64]>,
+    pub merkle_path:        Value<Vec<[u8; 32]>>,
 }
 ```
 
@@ -193,12 +230,15 @@ Sent once per transaction that needs compliance verification.
 ```json
 {
   "version": 1,
-  "tx_hash":                "0xabcd...ef",
-  "sender_addr":            "0x1234...56",
-  "receiver_addr":          "0x7890...ab",
-  "amount":                 1000000,
-  "compliance_merkle_root": "0xdeadbeef...",
-  "block_height":           99999,
+  "tx_hash":                  "0xabcd...ef",
+  "sender_pubkey":            "0xed1234...56",
+  "receiver_pubkey":          "0xed7890...ab",
+  "amount":                   1000000,
+  "sender_oracle_sig":        "0xsig1...",
+  "receiver_oracle_sig":      "0xsig2...",
+  "compliance_merkle_root":   "0xdeadbeef...",
+  "oracle_pubkey_hash":       "0xoraclehash...",
+  "block_height":             99999,
   "merkle_path": [
     "0xaabbcc...",
     "0xddeeff..."
@@ -247,8 +287,49 @@ validator receives response
   → decode public_inputs (hex → field elements)
   → verify_proof(vk, proof, public_inputs)
   → if Err(_): treat as non_compliant
-  → if Ok(()): forward tx to consensus
+  → if Ok(()): attach proof to tx, forward to consensus
 ```
+
+### 3.5 Proof Propagation Across the Validator Network
+
+Once a validator locally verifies a compliance proof, it does not re-generate
+the proof — it propagates it. This is critical for network consensus on
+compliance without each validator running a sidecar for the same transaction.
+
+**Propagation flow:**
+
+```
+Validator A                    Validator B                    Validator C
+    │                               │                               │
+    │── generates proof ────────────►                               │
+    │   (via own sidecar)           │── re-verifies proof ─────────►│
+    │                               │   (local verify_proof)       │── re-verifies
+    │                               │                               │   (local)
+    │◄─ RPCA consensus vote ────────┤◄──────────────────────────────┤
+    │   (proof attached to tx)      │                               │
+```
+
+**What propagates:** The `(tx_hash, proof_bytes, public_inputs)` tuple is
+attached to the transaction as it moves through the RPCA gossip layer. Any
+validator receiving it can verify the proof in ~10ms using only the shared
+verifying key — no sidecar required for verification.
+
+**Verifying key distribution:** The `compliance.vk` file (~50 KB) is distributed
+out-of-band at validator setup time (committed to the validator config repo).
+All validators on the network share the same verifying key for a given circuit
+version. Key rotation (e.g. after a circuit upgrade) requires a coordinated
+network upgrade, same as any consensus parameter change.
+
+**No double-proving:** Once a proof for `tx_hash` exists on the network, any
+validator that receives it just runs `verify_proof` locally. This means proof
+generation cost is paid once (by whichever validator first processes the tx),
+and verification cost (5–20ms) is paid by every other validator — an asymmetry
+that strongly favors network scalability.
+
+**Oracle key consistency:** All validators independently check that
+`oracle_pubkey_hash` in the proof's public inputs matches the currently active
+oracle pubkey registered on-chain. A proof using an expired oracle key is
+rejected even if the Halo2 proof itself is mathematically valid.
 
 ---
 
@@ -366,11 +447,14 @@ holds under the zero-knowledge property of PLONK:
 
 | Threat | Mitigation |
 |---|---|
-| Compromised sidecar returning false `"compliant"` | Validator independently re-verifies proof with `verify_proof`; forgery is computationally infeasible |
+| Compromised sidecar returning false `"compliant"` | Validator independently re-verifies proof with `verify_proof`; forgery is computationally infeasible under discrete log assumption |
 | Sidecar DoS (crash loop) | Pessimistic mode + quarantine queue; no transaction loss, no validator stall |
-| Merkle root manipulation (stale/forged root) | `block_height` is a public input; validators cross-check root against on-chain state at that height |
-| Replay of a valid proof for a different tx | C3 (hash binding) ties proof to specific `tx_hash`; reuse fails verification |
+| Stale/forged Merkle root | `block_height` is a public input; validators cross-check root against on-chain state at that height |
+| Replay of a valid proof for a different tx | C4 (hash binding) ties proof to specific `tx_hash`; reuse fails verification |
 | Prover equivocation (two valid proofs for conflicting txs) | Not possible with a deterministic circuit; same inputs always produce the same public outputs |
+| Forged oracle signature in witness | C1+C2 verify ed25519 sig inside the circuit against `oracle_pubkey_hash` (public); cannot forge without oracle private key |
+| Expired oracle key reuse | Validators reject proofs whose `oracle_pubkey_hash` doesn't match the current on-chain oracle key registration |
+| Oracle compromise (oracle signs non-compliant pubkeys) | Oracle key rotation invalidates all existing proofs; network upgrade required to accept new oracle key |
 
 ---
 
@@ -385,9 +469,17 @@ Halo2 PLONK proof generation time scales with the number of circuit rows
 |---|---|
 | Merkle depth | 20 levels |
 | Poseidon rounds per hash | ~60 constraints |
-| Estimated total rows | ~4,000 |
-| Estimated proof time (laptop CPU, 2024) | 400–800 ms |
-| Estimated proof time (server, AVX2) | 150–350 ms |
+| Ed25519 verify gate (×2, sender + receiver) | ~3,000 constraints each |
+| Estimated total rows | ~8,000 |
+| Estimated proof time (laptop CPU) | 800–1,500 ms |
+| Estimated proof time (server, AVX2) | 300–600 ms |
+
+The ed25519 in-circuit verification (C1+C2) roughly doubles circuit size vs the
+v1.0 Merkle-only design. This is the cost of oracle signature verification —
+it's justified by the stronger compliance guarantee. If proof time is a concern,
+the ed25519 gate can be replaced with a cheaper Schnorr-over-Pasta construction
+using native field arithmetic, reducing the gate to degree 3 and cutting proof
+time back to v1.0 levels. This is tracked as a future optimisation.
 
 Post Fiat target block time: **~1 second**. With a `PROOF_TIMEOUT_MS` of 2000 ms
 and server-class hardware, proof generation fits comfortably within the block
@@ -511,8 +603,10 @@ Key metrics to expose (Prometheus-compatible):
 
 ## References
 
+- [postfiatd — Post Fiat validator daemon (rippled fork)](https://github.com/postfiatorg/postfiatd)
+- [Post Fiat whitepaper](https://postfiat.org/whitepaper/)
 - [PSE Halo2 repo](https://github.com/privacy-scaling-explorations/halo2)
 - [Halo2 book](https://zcash.github.io/halo2/)
 - [Poseidon hash paper](https://eprint.iacr.org/2019/458)
 - [PLONK paper](https://eprint.iacr.org/2019/953)
-- Post Fiat validator spec (internal)
+- [Ed25519 spec (RFC 8032)](https://www.rfc-editor.org/rfc/rfc8032)
