@@ -419,7 +419,7 @@ false proof) without causing the network to accept a non-compliant transaction.
 ### 5.1 Soundness
 
 The circuit is **sound** if the Halo2 proof system is sound under the discrete
-log assumption over the Pasta curve (Pallas/Vesta). Concretely:
+log assumption over the BN254 curve (`bn256::Fr` field, KZG commitment scheme). Concretely:
 
 - An adversary cannot produce a valid proof for a `(sender, receiver)` pair that
   is NOT in the compliance Merkle tree, except with negligible probability
@@ -526,12 +526,15 @@ circuit at a fixed `k` parameter (circuit size = 2^k rows):
 ```bash
 # Run once per deployment; store outputs in /etc/pf-compliance/
 compliance-sidecar keygen --k 12 \
-  --pk-out /etc/pf-compliance/compliance.pk \
-  --vk-out /etc/pf-compliance/compliance.vk
+  --pk /etc/pf-compliance/compliance.pk \
+  --vk /etc/pf-compliance/compliance.vk \
+  --params /etc/pf-compliance/compliance.params
 ```
 
-The verifying key (`compliance.vk`) must be distributed to all validators. It is
-a ~50 KB file that can be committed to the validator config repo.
+The verifying key (`compliance.vk`) and params file (`compliance.params`) must be
+distributed to all validators. The verifying key is a ~50 KB file that can be
+committed to the validator config repo. The params file is required by the prover
+at runtime alongside the proving key.
 
 ### 7.3 Sidecar Configuration
 
