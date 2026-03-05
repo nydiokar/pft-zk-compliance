@@ -94,11 +94,57 @@ No special instance verification step needed.
 
 ---
 
+## Session 2026-03-05 — Unix Socket IPC Listener
+
+### What was done
+
+Implemented the full Unix domain socket listener in `crates/compliance-sidecar/src/main.rs`.
+
+**Architecture:**
+- `UnixListener` bound to `POSTFIAT_ZKP_SOCKET` env var (default `/tmp/postfiat_zkp.sock`)
+- Stale socket cleanup on startup (`remove_file` before `bind`)
+- `tokio::spawn` per connection — listener never blocks on slow provers
+- Newline-delimited JSON framing: one `ProofRequest` in, one `ProofResponse` out, connection closed
+- `into_split()` for owned read/write halves (avoids lifetime conflict with `BufReader`)
+- `spawn_blocking` for circuit work — async runtime not starved by CPU-bound proving
+
+**Prover integration:**
+- `run_circuit()` decodes all hex fields, validates `merkle_path` length (`2 * MERKLE_DEPTH`)
+- Builds `ComplianceCircuit { public, witness }` exactly as the circuit tests do
+- Constructs instance column using `bytes_to_field_fp` (exact mirror of `circuit.rs bytes_to_field`)
+- Runs `MockProver::run + verify()` — constraint logic is identical to production prover
+- Returns `"compliant"` / `"non_compliant"` / `"error"` status with populated `public_inputs` hex
+
+**Prototype proof_bytes:**
+Instance column serialized to bytes and base64-encoded as a stand-in for real proof bytes.
+Upgrade: replace `MockProver` block with `create_proof` once `Params`/`ProvingKey` init is added.
+
+**Error handling:**
+- Malformed JSON → `status: "error"`, `error` field set, sidecar continues
+- Hex decode failure → `status: "error"`, precise field name in error message
+- Wrong merkle_path length → `status: "error"` before circuit is even invoked
+- Constraint violation → `status: "non_compliant"`, logged
+- `spawn_blocking` panic → `status: "error"`, panic message forwarded
+
+**Platform decision:**
+`tokio::net::UnixListener` is gated on `cfg(unix)` by tokio.  Added `compile_error!` on
+non-Unix targets with a clear message.  All logic is in `mod inner { #[cfg(unix)] }`.
+The crate type-checks clean against `x86_64-unknown-linux-gnu` with zero warnings.
+Build from Windows: `cargo check --target x86_64-unknown-linux-gnu -p compliance-sidecar`
+
+**New dependencies added to compliance-sidecar:**
+- `halo2curves = "0.7"` — concrete `Fp` field type (was dev-dep in circuit crate only)
+- `base64 = "0.22"` — proof_bytes encoding
+- `hex = "0.4"` — hex field decoding
+
+---
+
 ## TODO (next sessions)
 - [x] Step 1: Implement `configure` and `synthesize` in `circuit.rs`
 - [x] Step 5: Push to GitHub remote
-- [ ] Step 2: Wire up actual proof generation in sidecar (`halo2_proofs::plonk::create_proof`)
-- [ ] Step 3: Implement rejection state machine
+- [x] Step 2: Unix socket IPC listener + MockProver dispatch in sidecar
+- [ ] Step 2b: Wire up real proof generation (`create_proof` + `ProvingKey` init from `Params`)
+- [ ] Step 3: Implement rejection state machine in postfiatd
 - [ ] Step 4: Polish SPEC.md into publishable form
 - [ ] Production upgrade: swap linear gates for `halo2_gadgets::poseidon::Hash` chip
 - [ ] Production upgrade: swap Merkle addition for binary Merkle chip
