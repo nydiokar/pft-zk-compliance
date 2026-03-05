@@ -499,7 +499,7 @@ mod tests {
     use super::*;
     use ff::{Field, PrimeField};
     use halo2_proofs::{circuit::Value, dev::MockProver};
-    use halo2curves::pasta::Fp;
+    use halo2curves::bn256::Fr;
 
     // ── Fixture builder ───────────────────────────────────────────────────
     //
@@ -517,24 +517,24 @@ mod tests {
     //
     // This way the fixture is defined by field values, not byte sums, and
     // changing MERKLE_DEPTH or the address bytes cannot cause silent overflow.
-    fn field_to_bytes(f: Fp) -> [u8; 32] {
-        // Fp::to_repr() gives the canonical little-endian byte representation.
+    fn field_to_bytes(f: Fr) -> [u8; 32] {
+        // Fr::to_repr() gives the canonical little-endian byte representation.
         f.to_repr().into()
     }
 
-    fn make_fixture() -> (ComplianceCircuit, Vec<Vec<Fp>>) {
+    fn make_fixture() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
         let sender_addr: [u8; 20] = [0x01u8; 20];
         let receiver_addr: [u8; 20] = [0x02u8; 20];
         let amount: u64 = 999;
         let block_height: u64 = 1_000_000;
 
         // Ground-truth field elements for sender and receiver.
-        let sender_f: Fp = bytes_to_field(&sender_addr);
-        let receiver_f: Fp = bytes_to_field(&receiver_addr);
+        let sender_f: Fr = bytes_to_field(&sender_addr);
+        let receiver_f: Fr = bytes_to_field(&receiver_addr);
 
         // tx_hash bytes encode (sender_f + receiver_f) so that
         // bytes_to_field(tx_hash) == sender_f + receiver_f exactly.
-        let tx_hash_f: Fp = sender_f + receiver_f;
+        let tx_hash_f: Fr = sender_f + receiver_f;
         let tx_hash: [u8; 32] = field_to_bytes(tx_hash_f);
 
         // Arbitrary but fixed sibling bytes for levels 0..MERKLE_DEPTH-2.
@@ -544,21 +544,21 @@ mod tests {
             a[0] = 0x07;
             a
         };
-        let common_f: Fp = bytes_to_field(&common_sibling);
+        let common_f: Fr = bytes_to_field(&common_sibling);
 
         // target_root_f: arbitrary field element that both paths will converge to.
         // Chosen as a fixed constant independent of address values.
-        let target_root_f: Fp = Fp::from(0xDEAD_BEEF_u64);
+        let target_root_f: Fr = Fr::from(0xDEAD_BEEF_u64);
 
         // Build a Merkle path for one side.
         // After (MERKLE_DEPTH-1) common siblings the running field value is:
         //   running = leaf_f + (MERKLE_DEPTH-1) * common_f
         // The last sibling must satisfy: running + last_sib_f = target_root_f
         //   → last_sib_f = target_root_f - running
-        let make_path = |leaf_f: Fp| -> Vec<[u8; 32]> {
-            let running: Fp = leaf_f
-                + common_f * Fp::from(MERKLE_DEPTH as u64 - 1);
-            let last_sib_f: Fp = target_root_f - running;
+        let make_path = |leaf_f: Fr| -> Vec<[u8; 32]> {
+            let running: Fr = leaf_f
+                + common_f * Fr::from(MERKLE_DEPTH as u64 - 1);
+            let last_sib_f: Fr = target_root_f - running;
 
             let mut path = vec![common_sibling; MERKLE_DEPTH - 1];
             path.push(field_to_bytes(last_sib_f));
@@ -569,8 +569,8 @@ mod tests {
         let receiver_path = make_path(receiver_f);
 
         // Verify both paths in field arithmetic — no byte-sum guesswork.
-        let check_path = |leaf_f: Fp, path: &[[u8; 32]]| -> Fp {
-            path.iter().fold(leaf_f, |cur, sib| cur + bytes_to_field::<Fp>(sib))
+        let check_path = |leaf_f: Fr, path: &[[u8; 32]]| -> Fr {
+            path.iter().fold(leaf_f, |cur, sib| cur + bytes_to_field::<Fr>(sib))
         };
         assert_eq!(check_path(sender_f, &sender_path), target_root_f);
         assert_eq!(check_path(receiver_f, &receiver_path), target_root_f);
@@ -590,10 +590,10 @@ mod tests {
         // Instance column (65 rows).
         // Only the three wired rows carry meaningful values; the rest are zero
         // because no constrain_instance call touches them.
-        let mut instance_col = vec![Fp::ZERO; NUM_INSTANCE_ROWS];
+        let mut instance_col = vec![Fr::ZERO; NUM_INSTANCE_ROWS];
         instance_col[TX_HASH_START] = tx_hash_f;
         instance_col[MERKLE_ROOT_START] = target_root_f;
-        instance_col[BLOCK_HEIGHT_ROW] = Fp::from(block_height);
+        instance_col[BLOCK_HEIGHT_ROW] = Fr::from(block_height);
 
         (circuit, vec![instance_col])
     }
@@ -603,7 +603,7 @@ mod tests {
     fn test_valid_witness_passes() {
         let (circuit, instance) = make_fixture();
         // k = 8 → 2^8 = 256 rows; sufficient for MERKLE_DEPTH = 4.
-        let prover = MockProver::<Fp>::run(8, &circuit, instance)
+        let prover = MockProver::<Fr>::run(8, &circuit, instance)
             .expect("MockProver::run failed");
         prover.verify().expect("Valid witness should satisfy all constraints");
     }
@@ -617,8 +617,8 @@ mod tests {
     fn test_wrong_tx_hash_fails() {
         let (circuit, mut instance) = make_fixture();
         // Corrupt the tx_hash instance value.
-        instance[0][TX_HASH_START] += Fp::from(1u64);
-        let prover = MockProver::<Fp>::run(8, &circuit, instance)
+        instance[0][TX_HASH_START] += Fr::from(1u64);
+        let prover = MockProver::<Fr>::run(8, &circuit, instance)
             .expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),
@@ -634,8 +634,8 @@ mod tests {
     #[test]
     fn test_wrong_merkle_root_fails() {
         let (circuit, mut instance) = make_fixture();
-        instance[0][MERKLE_ROOT_START] += Fp::from(1u64);
-        let prover = MockProver::<Fp>::run(8, &circuit, instance)
+        instance[0][MERKLE_ROOT_START] += Fr::from(1u64);
+        let prover = MockProver::<Fr>::run(8, &circuit, instance)
             .expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),
@@ -656,7 +656,7 @@ mod tests {
             w.merkle_path[0][0] ^= 0xFF;
             w
         });
-        let prover = MockProver::<Fp>::run(8, &circuit, instance)
+        let prover = MockProver::<Fr>::run(8, &circuit, instance)
             .expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),

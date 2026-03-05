@@ -139,11 +139,76 @@ Build from Windows: `cargo check --target x86_64-unknown-linux-gnu -p compliance
 
 ---
 
+---
+
+## Session 2026-03-05 — Keygen CLI + BN254 Field Migration
+
+### What was done
+
+Migrated `compliance-sidecar` from the Pasta scalar field (`Fp`) to the BN254
+scalar field (`Fr`) and added a `keygen` subcommand to produce real `.vk`, `.pk`,
+and `.params` files via `ParamsKZG<Bn256>`.
+
+**Why Fr?**
+`ParamsKZG<Bn256>` — the only KZG commitment scheme in the pinned PSE halo2 fork —
+requires `Circuit<Fr>`.  The `ComplianceCircuit` is already generic over
+`F: ff::PrimeField`, so zero circuit gate logic changed; only the sidecar's
+hardcoded `Fp` references were updated.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `crates/compliance-sidecar/Cargo.toml` | Added `clap = "4"`, `rand = "0.8"`, `rand_core = "0.6"` |
+| `crates/compliance-sidecar/src/main.rs` | Replaced `Fp` → `Fr` throughout; added `clap` CLI with `serve` / `keygen` subcommands |
+| `crates/compliance-circuit/src/circuit.rs` (tests) | Replaced `use halo2curves::pasta::Fp` with `use halo2curves::bn256::Fr`; all 4 tests pass |
+
+**keygen implementation:**
+- `ParamsKZG::<Bn256>::setup(k, OsRng)` — trusted-setup params
+- `keygen_vk_custom(&params, &circuit, true)` — compress_selectors=true
+- `keygen_pk_custom(&params, vk.clone(), &circuit, true)`
+- Writes `.params`, `.vk`, `.pk` to disk via `SerdeFormat::RawBytes`
+- Uses `Value::unknown()` for witness (keygen only needs constraint topology)
+
+**Verified on Windows (cross-platform keygen):**
+```
+compliance-sidecar keygen --k 8 --vk /tmp/test.vk --pk /tmp/test.pk --params /tmp/test.params
+# Outputs: params (33K), vk (518B), pk (305K)
+```
+
+**Key decisions:**
+- `compress_selectors = true` — must be consistent between keygen, prove, verify
+- `SerdeFormat::RawBytes` — fastest, no compression; fine for validator local storage
+- `params` written to disk as `.params` — prover needs this at runtime, not just pk/vk
+
+---
+
+## CLI Usage
+
+### keygen
+```
+compliance-sidecar keygen [--k 8] [--vk ./compliance.vk] [--pk ./compliance.pk] [--params ./compliance.params]
+```
+Generates proving and verification keys for the compliance circuit.
+Run once per deployment. Output files are required for proof generation.
+`k` controls circuit size: `2^k` rows. `k=8` is correct for `MERKLE_DEPTH=4`.
+
+### serve
+```
+compliance-sidecar serve [--socket /tmp/postfiat_zkp.sock]
+```
+Starts the Unix socket listener (Linux only). Currently uses `MockProver` as a
+stand-in for real proof generation.  Once `compliance.pk` and `compliance.params`
+exist (from `keygen`), the upgrade path is to swap `MockProver` for `create_proof`.
+
+---
+
 ## TODO (next sessions)
 - [x] Step 1: Implement `configure` and `synthesize` in `circuit.rs`
 - [x] Step 5: Push to GitHub remote
 - [x] Step 2: Unix socket IPC listener + MockProver dispatch in sidecar
-- [ ] Step 2b: Wire up real proof generation (`create_proof` + `ProvingKey` init from `Params`)
+- [x] Step 2a: Keygen CLI + BN254 field migration
+- [ ] Step 2b: Wire up real proof generation (`create_proof` + load `ProvingKey` from `compliance.pk`)
 - [ ] Step 3: Implement rejection state machine in postfiatd
 - [ ] Step 4: Polish SPEC.md into publishable form
 - [ ] Production upgrade: swap linear gates for `halo2_gadgets::poseidon::Hash` chip

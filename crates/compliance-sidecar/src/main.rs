@@ -1,23 +1,24 @@
-//! compliance-sidecar — Unix domain socket IPC listener.
+//! compliance-sidecar — Unix domain socket IPC listener + keygen CLI.
 //!
+//! # Subcommands
+//!
+//! ## serve  (Unix only)
 //! Accepts JSON [`ProofRequest`] messages from the postfiatd validator daemon,
 //! dispatches them to the Halo2 [`ComplianceCircuit`] prover, and returns a
 //! JSON [`ProofResponse`] over the same connection.
 //!
-//! # Wire protocol
+//! ## keygen  (cross-platform)
+//! Runs `keygen_vk` / `keygen_pk` against `ParamsKZG<Bn256>` and writes
+//! `.vk`, `.pk`, and `.params` files to disk.  Must be run once per
+//! deployment before the sidecar can generate real proofs.
+//!
+//! # Wire protocol  (serve)
 //!
 //! Each message is a single UTF-8 JSON object terminated by a newline (`\n`).
 //! One request per connection; the sidecar closes the connection after writing
-//! the response.  This keeps state minimal — the daemon opens a fresh connection
-//! for each transaction it wants proved.
+//! the response.
 //!
 //! # Prover status
-//!
-//! Full `create_proof` requires a `ProvingKey` derived from trusted-setup
-//! `Params`, which is a separate initialisation step (see TODO below).  For
-//! this prototype the circuit is exercised via `MockProver::run + verify()` so
-//! the constraint satisfaction logic is real; only the cryptographic proof
-//! object is absent.  Status field values:
 //!
 //! | Value             | Meaning                                            |
 //! |-------------------|----------------------------------------------------|
@@ -27,33 +28,188 @@
 //!
 //! # Platform
 //!
-//! This binary targets Unix systems (Linux validator nodes).  It will not
-//! compile on Windows because `tokio::net::UnixListener` is gated on
-//! `#[cfg(unix)]` by tokio.  Build via cross-compilation or in WSL:
+//! The `serve` subcommand targets Unix systems (Linux validator nodes) because
+//! `tokio::net::UnixListener` is gated on `#[cfg(unix)]`.  The `keygen`
+//! subcommand is cross-platform.  Build the full binary via:
 //!
 //! ```text
 //! cargo build --target x86_64-unknown-linux-gnu -p compliance-sidecar
 //! ```
 
-// Unix socket support is gated at the OS level in tokio.
-// Emit a clear compile error rather than a cryptic linker failure on Windows.
-#[cfg(not(unix))]
-compile_error!(
-    "compliance-sidecar requires a Unix target. \
-     Build with `--target x86_64-unknown-linux-gnu` or compile inside WSL."
-);
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI definition
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "compliance-sidecar", about = "Post Fiat ZKP compliance sidecar")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the Unix socket listener (Unix only).
+    Serve {
+        /// Path to the Unix domain socket.
+        #[arg(long, default_value = "/tmp/postfiat_zkp.sock")]
+        socket: String,
+    },
+    /// Generate proving/verifying keys for the compliance circuit.
+    Keygen {
+        /// Circuit size parameter: 2^k rows.  k=8 is correct for MERKLE_DEPTH=4.
+        #[arg(long, default_value_t = 8)]
+        k: u32,
+        /// Output path for the proving key.
+        #[arg(long, default_value = "./compliance.pk")]
+        pk: PathBuf,
+        /// Output path for the verifying key.
+        #[arg(long, default_value = "./compliance.vk")]
+        vk: PathBuf,
+        /// Output path for the KZG params (required by prover at runtime).
+        #[arg(long, default_value = "./compliance.params")]
+        params: PathBuf,
+    },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Serve { socket } => {
+            #[cfg(unix)]
+            inner::run(socket).await;
+
+            #[cfg(not(unix))]
+            {
+                let _ = socket;
+                eprintln!(
+                    "error: `serve` requires a Unix target. \
+                     Build with `--target x86_64-unknown-linux-gnu` or compile inside WSL."
+                );
+                std::process::exit(1);
+            }
+        }
+        Command::Keygen { k, pk, vk, params } => {
+            keygen::run(k, pk, vk, params);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// keygen subcommand (cross-platform, synchronous)
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod keygen {
+    use std::{
+        fs::File,
+        io::{BufWriter, Write},
+        path::PathBuf,
+    };
+
+    use compliance_circuit::{circuit::PublicInputs, ComplianceCircuit};
+    use halo2_proofs::{
+        circuit::Value,
+        plonk::{keygen_pk_custom, keygen_vk_custom},
+        poly::{commitment::Params, kzg::commitment::ParamsKZG},
+        SerdeFormat,
+    };
+    use halo2curves::bn256::Bn256;
+    use rand_core::OsRng;
+
+    /// Entry point for the `keygen` subcommand.
+    pub fn run(k: u32, pk_path: PathBuf, vk_path: PathBuf, params_path: PathBuf) {
+        eprintln!(
+            "[compliance-sidecar] generating KZG params for k={k} (2^k={} rows)...",
+            1u64 << k
+        );
+        let params = ParamsKZG::<Bn256>::setup(k, OsRng);
+
+        // keygen only needs the constraint topology — use empty witness.
+        let circuit = ComplianceCircuit {
+            public: dummy_public_inputs(),
+            witness: Value::unknown(),
+        };
+
+        eprintln!("[compliance-sidecar] running keygen_vk...");
+        let vk = keygen_vk_custom(&params, &circuit, true).expect("keygen_vk failed");
+
+        eprintln!("[compliance-sidecar] running keygen_pk...");
+        let pk = keygen_pk_custom(&params, vk.clone(), &circuit, true).expect("keygen_pk failed");
+
+        // Write params — prover needs these at runtime alongside pk.
+        write_file(&params_path, "params", |w| {
+            params.write(w).map_err(|e: std::io::Error| e.to_string())
+        });
+        // Write verifying key.
+        write_file(&vk_path, "vk", |w| {
+            vk.write(w, SerdeFormat::RawBytes).map_err(|e| e.to_string())
+        });
+        // Write proving key.
+        write_file(&pk_path, "pk", |w| {
+            pk.write(w, SerdeFormat::RawBytes).map_err(|e| e.to_string())
+        });
+
+        eprintln!("[compliance-sidecar] wrote params → {}", params_path.display());
+        eprintln!("[compliance-sidecar] wrote vk     → {}", vk_path.display());
+        eprintln!("[compliance-sidecar] wrote pk     → {}", pk_path.display());
+    }
+
+    /// Returns a `PublicInputs` with zero-filled byte arrays.
+    ///
+    /// Keygen only inspects the constraint topology — the actual field values
+    /// are never used.  `Value::unknown()` for the witness ensures `synthesize`
+    /// assigns `Value::unknown()` everywhere, which is the correct keygen mode.
+    fn dummy_public_inputs() -> PublicInputs {
+        PublicInputs {
+            tx_hash: [0u8; 32],
+            compliance_merkle_root: [0u8; 32],
+            block_height: 0,
+        }
+    }
+
+    /// Open `path`, wrap in `BufWriter`, call `f`, flush, and exit on error.
+    fn write_file<F>(path: &PathBuf, label: &str, f: F)
+    where
+        F: FnOnce(&mut BufWriter<File>) -> Result<(), String>,
+    {
+        let file = File::create(path).unwrap_or_else(|e| {
+            eprintln!("error: could not create {label} file '{}': {e}", path.display());
+            std::process::exit(1);
+        });
+        let mut writer = BufWriter::new(file);
+        f(&mut writer).unwrap_or_else(|e| {
+            eprintln!("error: could not write {label} to '{}': {e}", path.display());
+            std::process::exit(1);
+        });
+        writer.flush().unwrap_or_else(|e| {
+            eprintln!("error: flush failed for {label} '{}': {e}", path.display());
+            std::process::exit(1);
+        });
+    }
+
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// serve subcommand (Unix only)
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
 mod inner {
-    use std::env;
-
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use compliance_circuit::{
         circuit::{PublicInputs, Witness, MERKLE_DEPTH},
         ComplianceCircuit,
     };
     use halo2_proofs::{arithmetic::Field, circuit::Value, dev::MockProver};
-    use halo2curves::{ff::PrimeField, pasta::Fp};
+    use halo2curves::{bn256::Fr, ff::PrimeField};
     use serde::{Deserialize, Serialize};
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -67,7 +223,7 @@ mod inner {
     /// JSON request sent by the postfiatd daemon to the sidecar.
     #[derive(Debug, Deserialize)]
     pub struct ProofRequest {
-        #[allow(dead_code)] // present in IPC schema; reserved for protocol versioning
+        #[allow(dead_code)]
         pub version: u32,
         /// Hex-encoded Poseidon hash of the transaction (32 bytes).
         pub tx_hash: String,
@@ -94,7 +250,6 @@ mod inner {
         /// `"compliant"` | `"non_compliant"` | `"error"`
         pub status: String,
         /// Base64-encoded serialized Halo2 proof bytes.
-        /// Empty string when status is not `"compliant"`.
         pub proof_bytes: String,
         /// Hex-encoded public instance values fed into the proof verifier.
         pub public_inputs: Vec<String>,
@@ -109,21 +264,14 @@ mod inner {
     // Constants
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Default socket path; override with `POSTFIAT_ZKP_SOCKET` env var.
-    pub const DEFAULT_SOCKET_PATH: &str = "/tmp/postfiat_zkp.sock";
-
     /// MockProver circuit size parameter.  2^K rows must fit the circuit.
-    /// K=8 (256 rows) is sufficient for MERKLE_DEPTH=4.
     const CIRCUIT_K: u32 = 8;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Entry point
     // ─────────────────────────────────────────────────────────────────────────
 
-    pub async fn run() {
-        let socket_path = env::var("POSTFIAT_ZKP_SOCKET")
-            .unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
-
+    pub async fn run(socket_path: String) {
         // Remove a stale socket file from a previous run so bind() doesn't fail.
         let _ = std::fs::remove_file(&socket_path);
 
@@ -135,7 +283,6 @@ mod inner {
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
-                    // Spawn a task per connection so the listener never blocks.
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream).await {
                             eprintln!("[compliance-sidecar] connection error: {e}");
@@ -144,8 +291,6 @@ mod inner {
                 }
                 Err(e) => {
                     eprintln!("[compliance-sidecar] accept error: {e}");
-                    // Brief back-off on repeated accept failures to avoid a
-                    // tight error loop if the OS is under fd pressure.
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 }
             }
@@ -157,26 +302,16 @@ mod inner {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Maximum bytes accepted per request line.
-    ///
-    /// A `ProofRequest` with `2 * MERKLE_DEPTH` hex-encoded 32-byte siblings is at
-    /// most a few kilobytes.  16 KiB gives generous headroom while preventing an
-    /// unbounded-allocation attack from a misbehaving local process.
     const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 
-    /// Read one newline-terminated JSON request, process it, write the response.
     async fn handle_connection(stream: UnixStream) -> std::io::Result<()> {
-        // Split into owned halves so we can hold a BufReader on the read side
-        // while also writing to the write side without a lifetime conflict.
         let (read_half, mut write_half) = stream.into_split();
-        // Cap reads to MAX_REQUEST_BYTES so a misbehaving peer can't cause unbounded
-        // memory allocation via a line with no newline terminator.
         let mut reader = BufReader::new(read_half.take(MAX_REQUEST_BYTES));
 
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
 
         if n == 0 {
-            // Peer closed without sending anything — not an error.
             return Ok(());
         }
 
@@ -214,16 +349,10 @@ mod inner {
     // Prover (async wrapper)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Decode the request, run the circuit, return a [`ProofResponse`].
-    ///
-    /// All fallible steps produce `status = "error"` rather than propagating —
-    /// the sidecar must never crash on a bad daemon request.
     async fn prove(req: ProofRequest) -> ProofResponse {
         let start = std::time::Instant::now();
         let tx_hash_echo = req.tx_hash.clone();
 
-        // Offload CPU-intensive circuit work onto the blocking thread pool so
-        // the async runtime is not starved during proof generation.
         let result = tokio::task::spawn_blocking(move || run_circuit(req)).await;
 
         let proof_time_ms = start.elapsed().as_millis() as u64;
@@ -267,19 +396,17 @@ mod inner {
 
     /// Decode request fields, build [`ComplianceCircuit`], run [`MockProver`].
     ///
-    /// Returns `(status, proof_bytes_b64, public_inputs_hex)` on success,
-    /// or an error string on any decode / constraint failure.
-    ///
     /// # Prototype note
     ///
     /// Uses `MockProver` in place of `create_proof` because the latter requires
-    /// a `ProvingKey` derived from trusted-setup `Params` (a separate init step).
-    /// The constraint satisfaction logic — public input construction, witness
-    /// assignment, permutation checks — is identical to what a real prover runs.
-    ///
-    /// **Upgrade path:** swap `MockProver::run + verify()` for
-    /// `create_proof + verify_proof` once `Params` are available.
+    /// a `ProvingKey` derived from trusted-setup `Params` (produced by `keygen`).
+    /// **Upgrade path:** run `compliance-sidecar keygen` first, then swap
+    /// `MockProver::run + verify()` for `create_proof + verify_proof`.
     fn run_circuit(req: ProofRequest) -> ProverResult {
+        use compliance_circuit::circuit::{
+            BLOCK_HEIGHT_ROW, MERKLE_ROOT_START, NUM_INSTANCE_ROWS, TX_HASH_START,
+        };
+
         // ── Decode hex fields ────────────────────────────────────────────
         let tx_hash = decode_hex_32(&req.tx_hash, "tx_hash")?;
         let sender_addr = decode_hex_20(&req.sender_addr, "sender_addr")?;
@@ -302,22 +429,17 @@ mod inner {
             .collect::<Result<_, _>>()?;
 
         // ── Build circuit inputs ─────────────────────────────────────────
-        let public = PublicInputs { tx_hash, compliance_merkle_root, block_height: req.block_height };
+        let public =
+            PublicInputs { tx_hash, compliance_merkle_root, block_height: req.block_height };
         let witness = Witness { sender_addr, receiver_addr, amount: req.amount, merkle_path };
         let circuit = ComplianceCircuit { public: public.clone(), witness: Value::known(witness) };
 
         // ── Build instance column ────────────────────────────────────────
-        use compliance_circuit::circuit::{
-            BLOCK_HEIGHT_ROW, MERKLE_ROOT_START, NUM_INSTANCE_ROWS, TX_HASH_START,
-        };
+        let tx_hash_f: Fr = bytes_to_field_fr(&public.tx_hash);
+        let merkle_root_f: Fr = bytes_to_field_fr(&public.compliance_merkle_root);
+        let block_height_f: Fr = Fr::from(public.block_height);
 
-        // Mirror the bytes_to_field encoding used inside the circuit so the
-        // instance column we supply matches the advice cells it wires to.
-        let tx_hash_f: Fp = bytes_to_field_fp(&public.tx_hash);
-        let merkle_root_f: Fp = bytes_to_field_fp(&public.compliance_merkle_root);
-        let block_height_f: Fp = Fp::from(public.block_height);
-
-        let mut instance_col = vec![Fp::ZERO; NUM_INSTANCE_ROWS];
+        let mut instance_col = vec![Fr::ZERO; NUM_INSTANCE_ROWS];
         instance_col[TX_HASH_START] = tx_hash_f;
         instance_col[MERKLE_ROOT_START] = merkle_root_f;
         instance_col[BLOCK_HEIGHT_ROW] = block_height_f;
@@ -325,19 +447,16 @@ mod inner {
         let instance = vec![instance_col.clone()];
 
         // ── Run MockProver ───────────────────────────────────────────────
-        let prover = MockProver::<Fp>::run(CIRCUIT_K, &circuit, instance)
+        let prover = MockProver::<Fr>::run(CIRCUIT_K, &circuit, instance)
             .map_err(|e| format!("MockProver::run failed: {e:?}"))?;
 
         match prover.verify() {
             Ok(()) => {
-                // Constraint check passed.  In production this is where
-                // create_proof would run and return real proof bytes.
-                //
-                // PROTOTYPE: encode the public instance column as the "proof"
-                // so the response carries a verifiable non-empty payload.
+                // PROTOTYPE: encode the public instance column as the "proof".
+                // Upgrade: replace with `create_proof` once keygen keys are loaded.
                 let mock_proof_bytes: Vec<u8> = instance_col
                     .iter()
-                    .flat_map(|f: &Fp| f.to_repr().as_ref().to_vec())
+                    .flat_map(|f: &Fr| f.to_repr().as_ref().to_vec())
                     .collect();
                 let proof_b64 = B64.encode(&mock_proof_bytes);
 
@@ -353,8 +472,6 @@ mod inner {
                 Ok(("compliant".to_string(), proof_b64, public_inputs_hex))
             }
             Err(errors) => {
-                // Constraint violation: witness does not satisfy the circuit.
-                // The transaction is non-compliant or the Merkle path is wrong.
                 eprintln!("[compliance-sidecar] circuit verification failed: {errors:?}");
                 Ok(("non_compliant".to_string(), String::new(), vec![]))
             }
@@ -372,18 +489,14 @@ mod inner {
         let arr: [u8; 32] =
             bytes.try_into().map_err(|_| format!("{field}: expected 32 bytes, got {len}"))?;
 
-        // Guard: reject any 32-byte value that would exceed the Pasta Fp modulus
-        // (~2^254) and silently collapse to low 8 bytes in bytes_to_field_fp.
-        // Fp modulus in little-endian is 0x4000...000... with top two bits clear.
-        // A value >= p has its 31st byte (index 31, MSB in LE) >= 0x40.
-        // Rejecting here is conservative but prevents silent injectivity failure:
-        // two distinct hashes could map to the same field element if both >= p.
-        //
-        // PRODUCTION: replace bytes_to_field_fp with a Poseidon sponge, which
-        // operates on individual field elements and never truncates.
-        if arr[31] >= 0x40 {
+        // Guard: reject values that may equal or exceed the BN254 Fr modulus.
+        // Fr modulus in little-endian has byte[31] = 0x30.  Any input with
+        // byte[31] >= 0x30 might be >= p and fail from_repr, causing the
+        // bytes_to_field fallback to truncate to 8 bytes — silently losing
+        // injectivity.  Rejecting here is conservative and correct.
+        if arr[31] >= 0x30 {
             return Err(format!(
-                "{field}: value >= Fp modulus (MSB byte 0x{:02x}); \
+                "{field}: value >= Fr modulus (MSB byte 0x{:02x}); \
                  would silently collapse in field encoding — reject",
                 arr[31]
             ));
@@ -403,34 +516,22 @@ mod inner {
     // Field encoding  (mirrors circuit.rs bytes_to_field exactly)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Encode a byte slice as an `Fp` field element using little-endian packing.
+    /// Encode a byte slice as a BN254 `Fr` field element using little-endian packing.
     ///
     /// **Must** match `bytes_to_field` in `circuit.rs` exactly — the instance
     /// column values we supply to `MockProver` must agree with the advice cell
     /// values the circuit assigns internally, or the permutation check fails.
-    fn bytes_to_field_fp(bytes: &[u8]) -> Fp {
-        let mut repr = <Fp as PrimeField>::Repr::default();
+    fn bytes_to_field_fr(bytes: &[u8]) -> Fr {
+        let mut repr = <Fr as PrimeField>::Repr::default();
         {
             let s = repr.as_mut();
             let len = s.len().min(bytes.len());
             s[..len].copy_from_slice(&bytes[..len]);
         }
-        Fp::from_repr(repr).unwrap_or_else(|| {
+        Fr::from_repr(repr).unwrap_or_else(|| {
             let mut low = [0u8; 8];
             low.copy_from_slice(&bytes[..8.min(bytes.len())]);
-            Fp::from(u64::from_le_bytes(low))
+            Fr::from(u64::from_le_bytes(low))
         })
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// main
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[tokio::main]
-async fn main() {
-    #[cfg(unix)]
-    inner::run().await;
-
-    // The compile_error! above ensures we never reach here on non-Unix.
 }
