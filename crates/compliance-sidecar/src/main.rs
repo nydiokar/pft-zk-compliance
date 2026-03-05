@@ -57,6 +57,12 @@ enum Command {
         /// Path to the Unix domain socket.
         #[arg(long, default_value = "/tmp/postfiat_zkp.sock")]
         socket: String,
+        /// Path to the proving key produced by `keygen`.
+        #[arg(long, default_value = "./compliance.pk")]
+        pk: PathBuf,
+        /// Path to the KZG params produced by `keygen`.
+        #[arg(long, default_value = "./compliance.params")]
+        params: PathBuf,
     },
     /// Generate proving/verifying keys for the compliance circuit.
     Keygen {
@@ -83,13 +89,13 @@ enum Command {
 async fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { socket } => {
+        Command::Serve { socket, pk, params } => {
             #[cfg(unix)]
-            inner::run(socket).await;
+            inner::run(socket, pk, params).await;
 
             #[cfg(not(unix))]
             {
-                let _ = socket;
+                let _ = (socket, pk, params);
                 eprintln!(
                     "error: `serve` requires a Unix target. \
                      Build with `--target x86_64-unknown-linux-gnu` or compile inside WSL."
@@ -203,13 +209,32 @@ mod keygen {
 
 #[cfg(unix)]
 mod inner {
+    use std::{path::PathBuf, sync::Arc};
+
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use compliance_circuit::{
         circuit::{PublicInputs, Witness, MERKLE_DEPTH},
         ComplianceCircuit,
     };
-    use halo2_proofs::{arithmetic::Field, circuit::Value, dev::MockProver};
-    use halo2curves::{bn256::Fr, ff::PrimeField};
+    use halo2_proofs::{
+        arithmetic::Field,
+        circuit::Value,
+        plonk::{create_proof, pk_read, ProvingKey},
+        poly::{
+            commitment::Params,
+            kzg::{
+                commitment::{KZGCommitmentScheme, ParamsKZG},
+                multiopen::ProverSHPLONK,
+            },
+        },
+        transcript::{Blake2bWrite, Challenge255, TranscriptWriterBuffer},
+        SerdeFormat,
+    };
+    use halo2curves::{
+        bn256::{Bn256, Fr, G1Affine},
+        ff::PrimeField,
+    };
+    use rand_core::OsRng;
     use serde::{Deserialize, Serialize};
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -261,17 +286,64 @@ mod inner {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Constants
+    // Prover state — loaded once at startup, shared across all connections
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// MockProver circuit size parameter.  2^K rows must fit the circuit.
-    const CIRCUIT_K: u32 = 8;
+    struct ProverState {
+        params: ParamsKZG<Bn256>,
+        pk: ProvingKey<G1Affine>,
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Entry point
     // ─────────────────────────────────────────────────────────────────────────
 
-    pub async fn run(socket_path: String) {
+    pub async fn run(socket_path: String, pk_path: PathBuf, params_path: PathBuf) {
+        // ── Load KZG params ──────────────────────────────────────────────
+        eprintln!("[compliance-sidecar] loading params from {}", params_path.display());
+        let params = {
+            let mut f = std::fs::File::open(&params_path).unwrap_or_else(|e| {
+                eprintln!("error: cannot open params file '{}': {e}", params_path.display());
+                std::process::exit(1);
+            });
+            ParamsKZG::<Bn256>::read(&mut f).unwrap_or_else(|e| {
+                eprintln!("error: cannot deserialize params: {e}");
+                std::process::exit(1);
+            })
+        };
+
+        // ── Load proving key ─────────────────────────────────────────────
+        // pk_read reconstructs the constraint system from the circuit topology
+        // (same as keygen) and uses it to deserialize the raw proving key bytes.
+        eprintln!("[compliance-sidecar] loading proving key from {}", pk_path.display());
+        let pk = {
+            let dummy_circuit = ComplianceCircuit {
+                public: PublicInputs {
+                    tx_hash: [0u8; 32],
+                    compliance_merkle_root: [0u8; 32],
+                    block_height: 0,
+                },
+                witness: Value::unknown(),
+            };
+            let mut f = std::fs::File::open(&pk_path).unwrap_or_else(|e| {
+                eprintln!("error: cannot open pk file '{}': {e}", pk_path.display());
+                std::process::exit(1);
+            });
+            pk_read::<G1Affine, _, ComplianceCircuit>(
+                &mut f,
+                SerdeFormat::RawBytes,
+                params.k(),
+                &dummy_circuit,
+                true, // compress_selectors — must match keygen
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("error: cannot deserialize proving key: {e}");
+                std::process::exit(1);
+            })
+        };
+
+        let state = Arc::new(ProverState { params, pk });
+
         // Remove a stale socket file from a previous run so bind() doesn't fail.
         let _ = std::fs::remove_file(&socket_path);
 
@@ -283,8 +355,9 @@ mod inner {
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
+                    let state = Arc::clone(&state);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream).await {
+                        if let Err(e) = handle_connection(stream, state).await {
                             eprintln!("[compliance-sidecar] connection error: {e}");
                         }
                     });
@@ -304,7 +377,10 @@ mod inner {
     /// Maximum bytes accepted per request line.
     const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 
-    async fn handle_connection(stream: UnixStream) -> std::io::Result<()> {
+    async fn handle_connection(
+        stream: UnixStream,
+        state: Arc<ProverState>,
+    ) -> std::io::Result<()> {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half.take(MAX_REQUEST_BYTES));
 
@@ -321,7 +397,7 @@ mod inner {
                     "[compliance-sidecar] proof request: tx_hash={} block_height={}",
                     &req.tx_hash, req.block_height,
                 );
-                prove(req).await
+                prove(req, state).await
             }
             Err(e) => {
                 eprintln!("[compliance-sidecar] malformed request: {e}");
@@ -349,19 +425,16 @@ mod inner {
     // Prover (async wrapper)
     // ─────────────────────────────────────────────────────────────────────────
 
-    async fn prove(req: ProofRequest) -> ProofResponse {
-        let start = std::time::Instant::now();
+    async fn prove(req: ProofRequest, state: Arc<ProverState>) -> ProofResponse {
         let tx_hash_echo = req.tx_hash.clone();
 
-        let result = tokio::task::spawn_blocking(move || run_circuit(req)).await;
-
-        let proof_time_ms = start.elapsed().as_millis() as u64;
+        let result = tokio::task::spawn_blocking(move || run_circuit(req, &state)).await;
 
         match result {
-            Ok(Ok((status, proof_bytes, public_inputs))) => ProofResponse {
+            Ok(Ok((proof_bytes, public_inputs, proof_time_ms))) => ProofResponse {
                 version: 1,
                 tx_hash: tx_hash_echo,
-                status,
+                status: "compliant".to_string(),
                 proof_bytes,
                 public_inputs,
                 proof_time_ms,
@@ -373,7 +446,7 @@ mod inner {
                 status: "error".to_string(),
                 proof_bytes: String::new(),
                 public_inputs: vec![],
-                proof_time_ms,
+                proof_time_ms: 0,
                 error: e,
             },
             Err(e) => ProofResponse {
@@ -382,7 +455,7 @@ mod inner {
                 status: "error".to_string(),
                 proof_bytes: String::new(),
                 public_inputs: vec![],
-                proof_time_ms,
+                proof_time_ms: 0,
                 error: format!("prover task panicked: {e}"),
             },
         }
@@ -392,17 +465,12 @@ mod inner {
     // Circuit execution (blocking)
     // ─────────────────────────────────────────────────────────────────────────
 
-    type ProverResult = Result<(String, String, Vec<String>), String>;
+    type ProverResult = Result<(String, Vec<String>, u64), String>;
 
-    /// Decode request fields, build [`ComplianceCircuit`], run [`MockProver`].
-    ///
-    /// # Prototype note
-    ///
-    /// Uses `MockProver` in place of `create_proof` because the latter requires
-    /// a `ProvingKey` derived from trusted-setup `Params` (produced by `keygen`).
-    /// **Upgrade path:** run `compliance-sidecar keygen` first, then swap
-    /// `MockProver::run + verify()` for `create_proof + verify_proof`.
-    fn run_circuit(req: ProofRequest) -> ProverResult {
+    /// Decode request fields, build [`ComplianceCircuit`], and call
+    /// [`create_proof`] with a Blake2b transcript to generate a real
+    /// cryptographic proof.
+    fn run_circuit(req: ProofRequest, state: &ProverState) -> ProverResult {
         use compliance_circuit::circuit::{
             BLOCK_HEIGHT_ROW, MERKLE_ROOT_START, NUM_INSTANCE_ROWS, TX_HASH_START,
         };
@@ -425,7 +493,7 @@ mod inner {
             .merkle_path
             .iter()
             .enumerate()
-            .map(|(i, s)| decode_hex_32(s, &format!("merkle_path[{i}]")))
+            .map(|(i, s)| decode_hex_32_unchecked(s, &format!("merkle_path[{i}]")))
             .collect::<Result<_, _>>()?;
 
         // ── Build circuit inputs ─────────────────────────────────────────
@@ -444,38 +512,37 @@ mod inner {
         instance_col[MERKLE_ROOT_START] = merkle_root_f;
         instance_col[BLOCK_HEIGHT_ROW] = block_height_f;
 
-        let instance = vec![instance_col.clone()];
+        // ── Create real proof via SHPLONK + Blake2b transcript ───────────
+        let proof_start = std::time::Instant::now();
+        let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
 
-        // ── Run MockProver ───────────────────────────────────────────────
-        let prover = MockProver::<Fr>::run(CIRCUIT_K, &circuit, instance)
-            .map_err(|e| format!("MockProver::run failed: {e:?}"))?;
+        // instances: one entry per circuit, each containing one Vec per instance column.
+        let instances: Vec<Vec<Vec<Fr>>> = vec![vec![instance_col]];
 
-        match prover.verify() {
-            Ok(()) => {
-                // PROTOTYPE: encode the public instance column as the "proof".
-                // Upgrade: replace with `create_proof` once keygen keys are loaded.
-                let mock_proof_bytes: Vec<u8> = instance_col
-                    .iter()
-                    .flat_map(|f: &Fr| f.to_repr().as_ref().to_vec())
-                    .collect();
-                let proof_b64 = B64.encode(&mock_proof_bytes);
+        create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<Bn256>, _, _, _, _>(
+            &state.params,
+            &state.pk,
+            &[circuit],
+            &instances,
+            OsRng,
+            &mut transcript,
+        )
+        .map_err(|e| format!("create_proof failed: {e:?}"))?;
 
-                let public_inputs_hex: Vec<String> = [
-                    (TX_HASH_START, tx_hash_f),
-                    (MERKLE_ROOT_START, merkle_root_f),
-                    (BLOCK_HEIGHT_ROW, block_height_f),
-                ]
-                .iter()
-                .map(|(row, f)| format!("row{}:{}", row, hex::encode(f.to_repr().as_ref())))
-                .collect();
+        let proof_bytes: Vec<u8> = transcript.finalize();
+        let proof_time_ms = proof_start.elapsed().as_millis() as u64;
+        let proof_b64 = B64.encode(&proof_bytes);
 
-                Ok(("compliant".to_string(), proof_b64, public_inputs_hex))
-            }
-            Err(errors) => {
-                eprintln!("[compliance-sidecar] circuit verification failed: {errors:?}");
-                Ok(("non_compliant".to_string(), String::new(), vec![]))
-            }
-        }
+        let public_inputs_hex: Vec<String> = [
+            (TX_HASH_START, tx_hash_f),
+            (MERKLE_ROOT_START, merkle_root_f),
+            (BLOCK_HEIGHT_ROW, block_height_f),
+        ]
+        .iter()
+        .map(|(row, f)| format!("row{}:{}", row, hex::encode(f.to_repr().as_ref())))
+        .collect();
+
+        Ok((proof_b64, public_inputs_hex, proof_time_ms))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -505,6 +572,18 @@ mod inner {
         Ok(arr)
     }
 
+    /// Decode a hex string into 32 bytes without the modulus guard.
+    ///
+    /// Used for Merkle path siblings, which are advice (private) witness values.
+    /// They never pass through `from_repr`; `bytes_to_field_fr` handles reduction
+    /// internally, so any 32-byte value is valid input.
+    fn decode_hex_32_unchecked(s: &str, field: &str) -> Result<[u8; 32], String> {
+        let bytes = hex::decode(s.trim_start_matches("0x"))
+            .map_err(|e| format!("{field}: hex decode error: {e}"))?;
+        let len = bytes.len();
+        bytes.try_into().map_err(|_| format!("{field}: expected 32 bytes, got {len}"))
+    }
+
     fn decode_hex_20(s: &str, field: &str) -> Result<[u8; 20], String> {
         let bytes = hex::decode(s.trim_start_matches("0x"))
             .map_err(|e| format!("{field}: hex decode error: {e}"))?;
@@ -519,7 +598,7 @@ mod inner {
     /// Encode a byte slice as a BN254 `Fr` field element using little-endian packing.
     ///
     /// **Must** match `bytes_to_field` in `circuit.rs` exactly — the instance
-    /// column values we supply to `MockProver` must agree with the advice cell
+    /// column values we supply to the prover must agree with the advice cell
     /// values the circuit assigns internally, or the permutation check fails.
     fn bytes_to_field_fr(bytes: &[u8]) -> Fr {
         let mut repr = <Fr as PrimeField>::Repr::default();

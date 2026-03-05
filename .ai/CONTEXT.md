@@ -1,6 +1,6 @@
 # pf-zk-compliance — Project Context
 
-**Branch:** `master`  **Last Updated:** 2026-03-06  **Status:** Keygen CLI done, MockProver serving over Unix socket
+**Branch:** `master`  **Last Updated:** 2026-03-06  **Status:** Real proof generation done — `create_proof` + Blake2b transcript, pk/params loaded at startup
 
 ---
 
@@ -17,13 +17,13 @@
 | ✅ | **[ZK-6] Circuit `synthesize` impl** | L | 5 regions: load_witness, range_check, hash_binding (C3), sender_merkle (C1), receiver_merkle (C2). All public inputs wired to instance column via constrain_instance. 4 MockProver tests pass. |
 | ✅ | **[ZK-7] Sidecar socket listener** | M | Unix domain socket listener with tokio. Newline-delimited JSON, spawn_blocking for circuit work, stale socket cleanup on startup. Linux only (`cfg(unix)`). |
 | ✅ | **[ZK-8] Key generation CLI** | M | `compliance-sidecar keygen --k 8` command. Outputs `.params`, `.vk`, `.pk` via `ParamsKZG<Bn256>` + `keygen_vk_custom` / `keygen_pk_custom`. |
-| [ ] | **[ZK-9] Real proof generation** | M | Replace `MockProver` in `run_circuit()` with `create_proof`. Load `.pk` and `.params` from disk at sidecar startup. |
+| ✅ | **[ZK-9] Real proof generation** | M | `MockProver` replaced with `create_proof` (SHPLONK + Blake2b transcript). `ParamsKZG` + `ProvingKey` loaded via `pk_read` at startup into `Arc<ProverState>`. Proof bytes base64-encoded in `ProofResponse`. `serve` subcommand takes `--pk` and `--params` flags. |
 | [ ] | **[ZK-10] Proof verification in sidecar** | M | After `create_proof`, call `verify_proof` inside the sidecar before returning `"compliant"`. Ensures the sidecar never returns a verdict it can't back with a valid proof. |
 | [ ] | **[ZK-11] XRPL address encoding** | S | Swap `[u8; 20]` placeholder for XRPL base58 classic address format in circuit struct and IPC schema. |
 | [ ] | **[ZK-12] Poseidon hash gates** | L | Replace prototype linear gates (`a + b = c`) with `halo2_gadgets::poseidon::Hash` chip. Required for cryptographic soundness — current gates are not collision-resistant. |
 | [ ] | **[ZK-13] Binary Merkle chip** | L | Replace prototype additive Merkle path with proper binary Merkle chip. Pair with ZK-12 (Poseidon at each level). |
 | [ ] | **[ZK-14] Lookup table range check** | S | Replace tautological range gate with a proper lookup table constraining `amount` to u64. |
-| [ ] | **[ZK-15] postfiatd IPC hook** | L | C++ side of the socket interface in postfiatd. Calls sidecar before forwarding tx to RPCA consensus. Depends on ZK-9/10/11 being stable. |
+| [ ] | **[ZK-15] postfiatd IPC hook** | L | C++ side of the socket interface in postfiatd. Calls sidecar before forwarding tx to RPCA consensus. Depends on ZK-9/10/11 being stable. **When implementing: add `tokio::sync::Semaphore` in `ProverState` to cap concurrent `spawn_blocking` proof jobs — each proof is ~100-300 MB at k=8, unbounded concurrency under burst load causes OOM. Limit should be a `--max-concurrent-proofs` CLI flag sized against real circuit memory at production k.** |
 | [ ] | **[ZK-16] Pin halo2 git dep** | S | Add `rev = "<commit>"` to halo2_proofs git dep in all Cargo.toml files. Supply-chain hygiene before any production deployment. |
 
 ---
@@ -61,14 +61,14 @@
 | `SPEC.md` | Publishable architecture spec (v1.0 final) |
 | `docs/circuit_io.md` | Detailed circuit input table + constraint equations |
 | `crates/compliance-circuit/src/circuit.rs` | Full ComplianceCircuit: configure, synthesize, 4 MockProver tests |
-| `crates/compliance-sidecar/src/main.rs` | CLI (serve / keygen), Unix socket listener, MockProver dispatch |
+| `crates/compliance-sidecar/src/main.rs` | CLI (serve / keygen), Unix socket listener, real `create_proof` dispatch |
 | `.ai/DEVLOG.md` | Chronological session narrative — decisions, API gotchas, lineage detail |
 
 ---
 
 ## Known Issues / Notes
 
-- **[ZK-9 open]** `run_circuit()` still uses `MockProver`. Real proof generation requires loading `.pk` and `.params` at startup and calling `create_proof`.
+- **[ZK-9 done]** `run_circuit()` uses `create_proof` (SHPLONK + Blake2b). `serve` loads `.pk` + `.params` at startup via `pk_read` / `ParamsKZG::read`. `cargo check --target x86_64-unknown-linux-gnu` passes.
 - **[ZK-11 open]** `[u8; 20]` address type in `Witness` struct is an Ethereum-style placeholder. XRPL uses base58 classic addresses (different encoding).
 - **[open]** PSE halo2 git dep is unpinned (`git = "..."` without a rev). Must pin to a specific commit before any production deployment.
 - **[open, by design]** Prototype gates use linear arithmetic (`a + b = c`) in place of Poseidon. Circuit enforces correct constraint topology but is not cryptographically collision-resistant. Every substitution is annotated inline in `circuit.rs` with `PROTOTYPE:` / `PRODUCTION:` comments.
