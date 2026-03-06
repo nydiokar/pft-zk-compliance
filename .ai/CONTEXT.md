@@ -18,7 +18,7 @@
 | ✅ | **[ZK-7] Sidecar socket listener** | M | Unix domain socket listener with tokio. Newline-delimited JSON, spawn_blocking for circuit work, stale socket cleanup on startup. Linux only (`cfg(unix)`). |
 | ✅ | **[ZK-8] Key generation CLI** | M | `compliance-sidecar keygen --k 8` command. Outputs `.params`, `.vk`, `.pk` via `ParamsKZG<Bn256>` + `keygen_vk_custom` / `keygen_pk_custom`. |
 | ✅ | **[ZK-9] Real proof generation** | M | `MockProver` replaced with `create_proof` (SHPLONK + Blake2b transcript). `ParamsKZG` + `ProvingKey` loaded via `pk_read` at startup into `Arc<ProverState>`. Proof bytes base64-encoded in `ProofResponse`. `serve` subcommand takes `--pk` and `--params` flags. |
-| [ ] | **[ZK-10] Proof verification in sidecar** | M | After `create_proof`, call `verify_proof` inside the sidecar before returning `"compliant"`. Ensures the sidecar never returns a verdict it can't back with a valid proof. |
+| ✅ | **[ZK-10] Proof verification in sidecar** | M | `verify_proof_multi` (SHPLONK + Blake2b) called immediately after `create_proof`. VK loaded into `ProverState` at startup via `vk_read`. Verify failure → `"non_compliant"` status; internal errors → `"error"`. `serve` now takes `--vk` flag. `cargo check` passes. |
 | [ ] | **[ZK-11] XRPL address encoding** | S | Swap `[u8; 20]` placeholder for XRPL base58 classic address format in circuit struct and IPC schema. |
 | [ ] | **[ZK-12] Poseidon hash gates** | L | Replace prototype linear gates (`a + b = c`) with `halo2_gadgets::poseidon::Hash` chip. Required for cryptographic soundness — current gates are not collision-resistant. |
 | [ ] | **[ZK-13] Binary Merkle chip** | L | Replace prototype additive Merkle path with proper binary Merkle chip. Pair with ZK-12 (Poseidon at each level). |
@@ -69,6 +69,7 @@
 ## Known Issues / Notes
 
 - **[ZK-9 done]** `run_circuit()` uses `create_proof` (SHPLONK + Blake2b). `serve` loads `.pk` + `.params` at startup via `pk_read` / `ParamsKZG::read`. `cargo check --target x86_64-unknown-linux-gnu` passes.
+- **[ZK-10 done]** `verify_proof_multi` called after `create_proof` in `run_circuit`. VK loaded at startup via `vk_read` into `ProverState`. `serve --vk` flag added. Verify failure returns `"non_compliant"`; prover/decode errors return `"error"`. `cargo check` passes.
 - **[ZK-11 open]** `[u8; 20]` address type in `Witness` struct is an Ethereum-style placeholder. XRPL uses base58 classic addresses (different encoding).
 - **[open]** PSE halo2 git dep is unpinned (`git = "..."` without a rev). Must pin to a specific commit before any production deployment.
 - **[open, by design]** Prototype gates use linear arithmetic (`a + b = c`) in place of Poseidon. Circuit enforces correct constraint topology but is not cryptographically collision-resistant. Every substitution is annotated inline in `circuit.rs` with `PROTOTYPE:` / `PRODUCTION:` comments.

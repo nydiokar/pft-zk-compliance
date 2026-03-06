@@ -219,15 +219,19 @@ mod inner {
     use halo2_proofs::{
         arithmetic::Field,
         circuit::Value,
-        plonk::{create_proof, pk_read, ProvingKey},
+        plonk::{create_proof, pk_read, verify_proof_multi, ProvingKey},
         poly::{
             commitment::Params,
             kzg::{
                 commitment::{KZGCommitmentScheme, ParamsKZG},
-                multiopen::ProverSHPLONK,
+                multiopen::{ProverSHPLONK, VerifierSHPLONK},
+                strategy::SingleStrategy,
             },
         },
-        transcript::{Blake2bWrite, Challenge255, TranscriptWriterBuffer},
+        transcript::{
+            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer,
+            TranscriptWriterBuffer,
+        },
         SerdeFormat,
     };
     use halo2curves::{
@@ -440,14 +444,23 @@ mod inner {
                 proof_time_ms,
                 error: String::new(),
             },
-            Ok(Err(e)) => ProofResponse {
+            Ok(Err(ProverError::NonCompliant(msg))) => ProofResponse {
+                version: 1,
+                tx_hash: tx_hash_echo,
+                status: "non_compliant".to_string(),
+                proof_bytes: String::new(),
+                public_inputs: vec![],
+                proof_time_ms: 0,
+                error: msg,
+            },
+            Ok(Err(ProverError::Error(msg))) => ProofResponse {
                 version: 1,
                 tx_hash: tx_hash_echo,
                 status: "error".to_string(),
                 proof_bytes: String::new(),
                 public_inputs: vec![],
                 proof_time_ms: 0,
-                error: e,
+                error: msg,
             },
             Err(e) => ProofResponse {
                 version: 1,
@@ -465,36 +478,44 @@ mod inner {
     // Circuit execution (blocking)
     // ─────────────────────────────────────────────────────────────────────────
 
-    type ProverResult = Result<(String, Vec<String>, u64), String>;
+    enum ProverError {
+        /// Internal failure (decode error, prover bug, I/O error).
+        Error(String),
+        /// The proof was generated but failed self-verification.
+        NonCompliant(String),
+    }
 
-    /// Decode request fields, build [`ComplianceCircuit`], and call
-    /// [`create_proof`] with a Blake2b transcript to generate a real
-    /// cryptographic proof.
+    type ProverResult = Result<(String, Vec<String>, u64), ProverError>;
+
+    /// Decode request fields, build [`ComplianceCircuit`], call
+    /// [`create_proof`] to generate a real cryptographic proof, then
+    /// immediately call [`verify_proof_multi`] to self-verify before returning.
     fn run_circuit(req: ProofRequest, state: &ProverState) -> ProverResult {
         use compliance_circuit::circuit::{
             BLOCK_HEIGHT_ROW, MERKLE_ROOT_START, NUM_INSTANCE_ROWS, TX_HASH_START,
         };
 
         // ── Decode hex fields ────────────────────────────────────────────
-        let tx_hash = decode_hex_32(&req.tx_hash, "tx_hash")?;
-        let sender_addr = decode_hex_20(&req.sender_addr, "sender_addr")?;
-        let receiver_addr = decode_hex_20(&req.receiver_addr, "receiver_addr")?;
+        let tx_hash = decode_hex_32(&req.tx_hash, "tx_hash").map_err(ProverError::Error)?;
+        let sender_addr = decode_hex_20(&req.sender_addr, "sender_addr").map_err(ProverError::Error)?;
+        let receiver_addr = decode_hex_20(&req.receiver_addr, "receiver_addr").map_err(ProverError::Error)?;
         let compliance_merkle_root =
-            decode_hex_32(&req.compliance_merkle_root, "compliance_merkle_root")?;
+            decode_hex_32(&req.compliance_merkle_root, "compliance_merkle_root").map_err(ProverError::Error)?;
 
         let expected_path_len = 2 * MERKLE_DEPTH;
         if req.merkle_path.len() != expected_path_len {
-            return Err(format!(
+            return Err(ProverError::Error(format!(
                 "merkle_path must have {expected_path_len} entries (got {})",
                 req.merkle_path.len()
-            ));
+            )));
         }
         let merkle_path: Vec<[u8; 32]> = req
             .merkle_path
             .iter()
             .enumerate()
             .map(|(i, s)| decode_hex_32_unchecked(s, &format!("merkle_path[{i}]")))
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, _>>()
+            .map_err(ProverError::Error)?;
 
         // ── Build circuit inputs ─────────────────────────────────────────
         let public =
@@ -527,10 +548,41 @@ mod inner {
             OsRng,
             &mut transcript,
         )
-        .map_err(|e| format!("create_proof failed: {e:?}"))?;
+        .map_err(|e| ProverError::Error(format!("create_proof failed: {e:?}")))?;
 
         let proof_bytes: Vec<u8> = transcript.finalize();
         let proof_time_ms = proof_start.elapsed().as_millis() as u64;
+
+        // ── Verify the proof before returning "compliant" ────────────────
+        // The sidecar must never hand back a verdict it can't back with a
+        // valid proof.  Verification uses the same SHPLONK strategy and
+        // Blake2b transcript as the prover — parameters must match exactly.
+        {
+            let verifier_params = state.params.verifier_params();
+            // verify_proof_multi takes &[Vec<Vec<Fr>>]: one entry per circuit,
+            // each a vec of instance columns, each a vec of scalar values.
+            let verify_instances: Vec<Vec<Fr>> = instances[0].clone();
+            let mut verify_transcript =
+                Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&proof_bytes[..]);
+            let ok = verify_proof_multi::<
+                KZGCommitmentScheme<Bn256>,
+                VerifierSHPLONK<Bn256>,
+                _,
+                _,
+                SingleStrategy<Bn256>,
+            >(
+                &verifier_params,
+                state.pk.get_vk(),
+                &[verify_instances],
+                &mut verify_transcript,
+            );
+            if !ok {
+                return Err(ProverError::NonCompliant(
+                    "proof verification failed: self-check rejected the generated proof".to_string(),
+                ));
+            }
+        }
+
         let proof_b64 = B64.encode(&proof_bytes);
 
         let public_inputs_hex: Vec<String> = [
