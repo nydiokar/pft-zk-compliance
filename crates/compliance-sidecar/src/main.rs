@@ -685,7 +685,6 @@ mod tests {
         circuit::Value,
         plonk::{create_proof, keygen_pk_custom, keygen_vk_custom, verify_proof_multi},
         poly::{
-            commitment::Params,
             kzg::{
                 commitment::{KZGCommitmentScheme, ParamsKZG},
                 multiopen::{ProverSHPLONK, VerifierSHPLONK},
@@ -778,7 +777,7 @@ mod tests {
             witness: Value::unknown(),
         };
         let vk = keygen_vk_custom(&params, &dummy, true).expect("keygen_vk failed");
-        let pk = keygen_pk_custom(&params, vk, &dummy, true).expect("keygen_pk failed");
+        let pk = keygen_pk_custom(&params, vk.clone(), &dummy, true).expect("keygen_pk failed");
 
         let (circuit, instance_col) = make_circuit_and_instances();
         let instances: Vec<Vec<Vec<Fr>>> = vec![instance_col.clone()];
@@ -792,6 +791,7 @@ mod tests {
         let proof_bytes = transcript.finalize();
 
         let verifier_params = params.verifier_params();
+        let vk_for_verify = pk.get_vk();
         let verify = |proof: &[u8]| -> bool {
             let mut t = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof);
             verify_proof_multi::<
@@ -800,7 +800,7 @@ mod tests {
                 _,
                 _,
                 SingleStrategy<Bn256>,
-            >(&verifier_params, pk.get_vk(), &[instance_col.clone()], &mut t)
+            >(&verifier_params, vk_for_verify, &[instance_col.clone()], &mut t)
         };
 
         // Valid proof must pass.

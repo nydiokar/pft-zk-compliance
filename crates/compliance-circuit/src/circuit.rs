@@ -429,8 +429,8 @@ impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
 ///        c[i] = parent  = node + sibling   ← s_merkle gate
 /// ```
 ///
-/// At depth `MERKLE_DEPTH - 1`, an extra anchor row is added via
-/// `assign_advice_from_constant` to plant the expected root value.
+/// At depth `MERKLE_DEPTH - 1`, an extra anchor row is added in advice
+/// to plant the expected root value.
 /// A `constrain_equal` between `parent_cell` and the anchor enforces
 /// that the computed root matches — regardless of the path values.
 ///
@@ -465,17 +465,15 @@ fn assign_merkle_region<F: ff::PrimeField>(
                     region.assign_advice(|| "parent", config.c, depth, || parent)?;
 
                 if depth == MERKLE_DEPTH - 1 {
-                    // Plant the expected root as a fixed constant in the row
-                    // immediately after the last Merkle row, then enforce
-                    // equality between computed_parent and expected_root.
-                    // This is the root-binding constraint: if the path is wrong
-                    // the computed parent won't equal the committed root and
-                    // verify() will return a Permutation error.
-                    let root_anchor = region.assign_advice_from_constant(
+                    // Assign expected_root in advice (not fixed) so the value
+                    // can vary per proof. Using fixed-column constants here
+                    // would couple VK/PK to a specific root and break proof
+                    // verification for other inputs.
+                    let root_anchor = region.assign_advice(
                         || "root_anchor",
                         config.c,
                         depth + 1,
-                        expected_root,
+                        || Value::known(expected_root),
                     )?;
                     region.constrain_equal(parent_cell.cell(), root_anchor.cell())?;
                     final_parent_cell = Some(parent_cell);
