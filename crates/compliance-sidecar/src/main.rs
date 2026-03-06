@@ -666,3 +666,149 @@ mod inner {
         })
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use compliance_circuit::{
+        circuit::{
+            PublicInputs, Witness, BLOCK_HEIGHT_ROW, MERKLE_DEPTH, MERKLE_ROOT_START,
+            NUM_INSTANCE_ROWS, TX_HASH_START,
+        },
+        ComplianceCircuit,
+    };
+    use halo2_proofs::{
+        arithmetic::Field,
+        circuit::Value,
+        plonk::{create_proof, keygen_pk_custom, keygen_vk_custom, verify_proof_multi},
+        poly::{
+            commitment::Params,
+            kzg::{
+                commitment::{KZGCommitmentScheme, ParamsKZG},
+                multiopen::{ProverSHPLONK, VerifierSHPLONK},
+                strategy::SingleStrategy,
+            },
+        },
+        transcript::{
+            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
+        },
+    };
+    use halo2curves::{
+        bn256::{Bn256, Fr, G1Affine},
+        ff::PrimeField,
+    };
+    use rand_core::OsRng;
+
+    fn bytes_to_field_fr(bytes: &[u8]) -> Fr {
+        let mut repr = <Fr as PrimeField>::Repr::default();
+        let s = repr.as_mut();
+        let len = s.len().min(bytes.len());
+        s[..len].copy_from_slice(&bytes[..len]);
+        Fr::from_repr(repr).unwrap_or_else(|| {
+            let mut low = [0u8; 8];
+            low.copy_from_slice(&bytes[..8.min(bytes.len())]);
+            Fr::from(u64::from_le_bytes(low))
+        })
+    }
+
+    /// Build a minimal but valid circuit + instance column for k=8.
+    fn make_circuit_and_instances() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
+        let sender_addr = [0x01u8; 20];
+        let receiver_addr = [0x02u8; 20];
+        let amount: u64 = 42;
+        let block_height: u64 = 1;
+
+        // Derive field elements so the prototype gates (a+b=c) are satisfied.
+        let sender_f = bytes_to_field_fr(&sender_addr);
+        let receiver_f = bytes_to_field_fr(&receiver_addr);
+        let tx_hash_f = sender_f + receiver_f;
+        let tx_hash: [u8; 32] = tx_hash_f.to_repr().into();
+
+        let common_sib: [u8; 32] = { let mut a = [0u8; 32]; a[0] = 0x07; a };
+        let common_f = bytes_to_field_fr(&common_sib);
+        let root_f = Fr::from(0xDEAD_BEEF_u64);
+
+        let make_path = |leaf_f: Fr| -> Vec<[u8; 32]> {
+            let running = leaf_f + common_f * Fr::from(MERKLE_DEPTH as u64 - 1);
+            let last: [u8; 32] = (root_f - running).to_repr().into();
+            let mut p = vec![common_sib; MERKLE_DEPTH - 1];
+            p.push(last);
+            p
+        };
+
+        let merkle_path: Vec<[u8; 32]> = make_path(sender_f)
+            .into_iter()
+            .chain(make_path(receiver_f))
+            .collect();
+
+        let compliance_merkle_root: [u8; 32] = root_f.to_repr().into();
+
+        let public = PublicInputs { tx_hash, compliance_merkle_root, block_height };
+        let witness = Witness { sender_addr, receiver_addr, amount, merkle_path };
+        let circuit = ComplianceCircuit { public: public.clone(), witness: Value::known(witness) };
+
+        let tx_hash_field = bytes_to_field_fr(&public.tx_hash);
+        let merkle_root_field = bytes_to_field_fr(&public.compliance_merkle_root);
+        let block_height_field = Fr::from(public.block_height);
+
+        let mut instance_col = vec![Fr::ZERO; NUM_INSTANCE_ROWS];
+        instance_col[TX_HASH_START] = tx_hash_field;
+        instance_col[MERKLE_ROOT_START] = merkle_root_field;
+        instance_col[BLOCK_HEIGHT_ROW] = block_height_field;
+
+        (circuit, vec![instance_col])
+    }
+
+    /// Generates real params + pk for k=8, proves, verifies. Asserts valid proof passes.
+    /// Then flips one byte in the proof and asserts verify_proof_multi returns false.
+    #[test]
+    fn test_verify_proof_multi_valid_and_corrupted() {
+        let k: u32 = 8;
+        let params = ParamsKZG::<Bn256>::setup(k, OsRng);
+
+        let dummy = ComplianceCircuit {
+            public: PublicInputs {
+                tx_hash: [0u8; 32],
+                compliance_merkle_root: [0u8; 32],
+                block_height: 0,
+            },
+            witness: Value::unknown(),
+        };
+        let vk = keygen_vk_custom(&params, &dummy, true).expect("keygen_vk failed");
+        let pk = keygen_pk_custom(&params, vk, &dummy, true).expect("keygen_pk failed");
+
+        let (circuit, instance_col) = make_circuit_and_instances();
+        let instances: Vec<Vec<Vec<Fr>>> = vec![instance_col.clone()];
+
+        // ── Prove ────────────────────────────────────────────────────────
+        let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
+        create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<Bn256>, _, _, _, _>(
+            &params, &pk, &[circuit], &instances, OsRng, &mut transcript,
+        )
+        .expect("create_proof failed");
+        let proof_bytes = transcript.finalize();
+
+        let verifier_params = params.verifier_params();
+        let verify = |proof: &[u8]| -> bool {
+            let mut t = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof);
+            verify_proof_multi::<
+                KZGCommitmentScheme<Bn256>,
+                VerifierSHPLONK<Bn256>,
+                _,
+                _,
+                SingleStrategy<Bn256>,
+            >(&verifier_params, pk.get_vk(), &[instance_col.clone()], &mut t)
+        };
+
+        // Valid proof must pass.
+        assert!(verify(&proof_bytes), "valid proof failed verification");
+
+        // Corrupt one byte — must fail.
+        let mut corrupted = proof_bytes.clone();
+        corrupted[0] ^= 0xFF;
+        assert!(!verify(&corrupted), "corrupted proof passed verification (bug!)");
+    }
+}
