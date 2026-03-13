@@ -22,29 +22,25 @@
 //! | Advice      | `amount`               | witness             |
 //! | Advice      | `sender_oracle_sig`    | witness             |
 //! | Advice      | `receiver_oracle_sig`  | witness             |
-//! | Advice      | `merkle_path`          | witness             |
+//! | Advice      | `sender_merkle_*`      | witness             |
+//! | Advice      | `receiver_merkle_*`    | witness             |
 //!
 //! # Gate design (see also `docs/circuit_io.md`)
 //!
 //! | Gate              | Constraint                          | Degree |
 //! |-------------------|-------------------------------------|--------|
 //! | `tx_hash_poseidon`| Poseidon round transition           | 5      |
-//! | `merkle_path`     | `node + sibling = parent`           | 2      |
+//! | `merkle_path`     | direction bit + child ordering      | 2      |
 //! | `range_check`     | tautological placeholder            | 1      |
 //!
 //! # Prototype substitutions
 //!
 //! One primitive from the spec (`docs/circuit_io.md`) is still **intentionally
-//! simplified** for this prototype.  Each substitution is marked in the code
+//! simplified** for this prototype. Each substitution is marked in the code
 //! with a `PROTOTYPE:` comment and a `PRODUCTION:` comment explaining the
 //! upgrade path.
 //!
-//! 1. **Merkle node hashing** — spec calls for Poseidon(left, right) at each
-//!    level.  We use `left + right = parent` for the same reason.  The path-
-//!    traversal structure, region layout, and root-equality constraint are all
-//!    production-ready.
-//!
-//! 2. **Range check** — spec calls for a lookup table against a u64 range.
+//! **Range check** — spec calls for a lookup table against a u64 range.
 //!    We use a tautological gate (`s*(a-a)=0`) because the lookup-table gadget
 //!    requires a separate table column.  The selector wire-up is production-ready.
 //!
@@ -137,11 +133,16 @@ pub struct Witness {
     /// PROTOTYPE: stored in the witness boundary but not yet constrained until
     /// the Ed25519 verification gadget lands.
     pub receiver_oracle_sig: [u8; 64],
-    /// Sibling hashes for both Merkle membership proofs, concatenated.
-    /// Layout: `[sender_sibling_0, .., sender_sibling_{D-1},
-    ///           receiver_sibling_0, .., receiver_sibling_{D-1}]`
-    /// where D = `MERKLE_DEPTH`.
-    pub merkle_path: Vec<[u8; 32]>,
+    /// Sender sibling nodes for the fixed-depth Merkle path.
+    pub sender_merkle_siblings: Vec<[u8; 32]>,
+    /// Sender per-level direction bits.
+    /// `false` means current node is the left child, `true` means right child.
+    pub sender_merkle_directions: Vec<bool>,
+    /// Receiver sibling nodes for the fixed-depth Merkle path.
+    pub receiver_merkle_siblings: Vec<[u8; 32]>,
+    /// Receiver per-level direction bits.
+    /// `false` means current node is the left child, `true` means right child.
+    pub receiver_merkle_directions: Vec<bool>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -151,11 +152,11 @@ pub struct Witness {
 /// Column and gate configuration for `ComplianceCircuit`.
 #[derive(Clone, Debug)]
 pub struct ComplianceConfig {
-    /// Left operand: sender field element / current Merkle node.
+    /// Left operand: sender field element / current Merkle node / ordered left child.
     pub a: Column<Advice>,
-    /// Right operand: receiver field element / Merkle sibling.
+    /// Right operand: receiver field element / Merkle sibling / ordered right child.
     pub b: Column<Advice>,
-    /// Output: tx_hash commitment / Merkle parent node.
+    /// Output: tx_hash commitment / Merkle direction bit / Merkle parent node.
     pub c: Column<Advice>,
     /// Fourth state word for the tx-hash Poseidon permutation.
     pub d: Column<Advice>,
@@ -207,7 +208,7 @@ impl ComplianceConfig {
         let s_merkle = meta.selector();
         let s_range = meta.selector();
 
-        let mds = tx_poseidon_mds::<F>();
+        let mds = poseidon_mds::<F>();
         let pow_5 = |value: Expression<F>| {
             let value_sq = value.clone() * value.clone();
             value_sq.clone() * value_sq * value
@@ -258,20 +259,30 @@ impl ComplianceConfig {
         });
 
         // ── C1 / C2: Merkle-path gate ────────────────────────────────────
-        // Enforces: node + sibling = parent  (one row per tree level).
+        // Enforces per-level child ordering from a boolean direction bit.
         //
-        // PROTOTYPE: additive combination — not collision-resistant.
-        // PRODUCTION: replace with Poseidon(left, right) node combination
-        //   inside a binary Merkle chip (e.g. halo2_gadgets MerkleChip).
-        //   The per-level row structure and final root equality constraint
-        //   are identical.
+        // Row i stores `(node, sibling, direction_bit)`.
+        // Row i+1 starts the Poseidon state with `(left, right, 0, domain_tag)`.
+        //
+        // direction_bit = 0  →  left = node,    right = sibling
+        // direction_bit = 1  →  left = sibling, right = node
         meta.create_gate("merkle_path", |vc| {
             let s = vc.query_selector(s_merkle);
             let node = vc.query_advice(a, Rotation::cur());
             let sibling = vc.query_advice(b, Rotation::cur());
-            let parent = vc.query_advice(c, Rotation::cur());
-            // s_merkle * (node + sibling - parent) = 0
-            vec![s * (node + sibling - parent)]
+            let direction_bit = vc.query_advice(c, Rotation::cur());
+            let left = vc.query_advice(a, Rotation::next());
+            let right = vc.query_advice(b, Rotation::next());
+            let one = Expression::Constant(F::ONE);
+
+            vec![
+                s.clone() * direction_bit.clone() * (one - direction_bit.clone()),
+                s.clone()
+                    * (left
+                        - (node.clone()
+                            + direction_bit.clone() * (sibling.clone() - node.clone()))),
+                s * (right - (sibling.clone() + direction_bit * (node - sibling))),
+            ]
         });
 
         // ── Range gate ───────────────────────────────────────────────────
@@ -368,26 +379,30 @@ where
     }
 }
 
-fn tx_poseidon_constants<F>() -> Vec<[F; TX_POSEIDON_WIDTH]>
+fn poseidon_constants<F>() -> Vec<[F; TX_POSEIDON_WIDTH]>
 where
     F: ff::PrimeField + FromUniformBytes<64> + Ord,
 {
     TxHashPoseidonSpec::constants().0
 }
 
-fn tx_poseidon_mds<F>() -> Mds<F, TX_POSEIDON_WIDTH>
+fn poseidon_mds<F>() -> Mds<F, TX_POSEIDON_WIDTH>
 where
     F: ff::PrimeField + FromUniformBytes<64> + Ord,
 {
     TxHashPoseidonSpec::constants().1
 }
 
-fn tx_poseidon_hash_words<F>(message: [F; TX_POSEIDON_RATE]) -> F
+fn poseidon_hash_words<F, const L: usize>(message: [F; L]) -> F
 where
     F: ff::PrimeField + FromUniformBytes<64> + Ord,
 {
-    PoseidonHash::<F, TxHashPoseidonSpec, ConstantLength<TX_POSEIDON_RATE>, TX_POSEIDON_WIDTH, TX_POSEIDON_RATE>::init()
+    PoseidonHash::<F, TxHashPoseidonSpec, ConstantLength<L>, TX_POSEIDON_WIDTH, TX_POSEIDON_RATE>::init()
         .hash(message)
+}
+
+fn poseidon_domain_tag<F: ff::PrimeField>(message_len: usize) -> F {
+    F::from_u128((message_len as u128) << 64)
 }
 
 pub fn tx_hash_field_from_inputs<F>(
@@ -398,18 +413,25 @@ pub fn tx_hash_field_from_inputs<F>(
 where
     F: ff::PrimeField + FromUniformBytes<64> + Ord,
 {
-    tx_poseidon_hash_words([
+    poseidon_hash_words([
         bytes_to_field(sender_pubkey),
         bytes_to_field(receiver_pubkey),
         F::from(amount),
     ])
 }
 
+pub fn merkle_parent_hash_fields<F>(left: F, right: F) -> F
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
+    poseidon_hash_words([left, right])
+}
+
 fn pow5_field<F: ff::PrimeField>(value: F) -> F {
     value.pow_vartime([5])
 }
 
-fn tx_poseidon_round<F>(
+fn poseidon_round<F>(
     state: [F; TX_POSEIDON_WIDTH],
     round_constants: [F; TX_POSEIDON_WIDTH],
     mds: &Mds<F, TX_POSEIDON_WIDTH>,
@@ -434,6 +456,66 @@ where
             .map(|col| mds[row][col] * transformed[col])
             .fold(F::ZERO, |acc, term| acc + term)
     })
+}
+
+fn assign_poseidon_permutation<F>(
+    config: &ComplianceConfig,
+    region: &mut Region<'_, F>,
+    start_row: usize,
+    initial_state: [Value<F>; TX_POSEIDON_WIDTH],
+    round_constants: &[[F; TX_POSEIDON_WIDTH]],
+    mds: &Mds<F, TX_POSEIDON_WIDTH>,
+) -> Result<AssignedCell<F, F>, ErrorFront>
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
+    let mut current_state = initial_state;
+    let mut final_state = None;
+
+    for (round, round_constant_row) in round_constants.iter().enumerate() {
+        let row = start_row + round;
+        let is_full_round = round < TX_POSEIDON_FULL_ROUNDS / 2
+            || round >= TX_POSEIDON_FULL_ROUNDS / 2 + TX_POSEIDON_PARTIAL_ROUNDS;
+        if is_full_round {
+            config.s_poseidon_full.enable(region, row)?;
+        } else {
+            config.s_poseidon_partial.enable(region, row)?;
+        }
+
+        for (column, round_constant) in config.poseidon_rc.iter().zip(round_constant_row.iter()) {
+            region.assign_fixed(
+                || "poseidon_round_constant",
+                *column,
+                row,
+                || Value::known(*round_constant),
+            )?;
+        }
+
+        let next_state = current_state[0]
+            .zip(current_state[1])
+            .zip(current_state[2])
+            .zip(current_state[3])
+            .map(|(((a, b), c), d)| poseidon_round([a, b, c, d], *round_constant_row, mds, is_full_round));
+
+        let next_cells = [
+            region.assign_advice(|| "poseidon_next_0", config.a, row + 1, || next_state.map(|state| state[0]))?,
+            region.assign_advice(|| "poseidon_next_1", config.b, row + 1, || next_state.map(|state| state[1]))?,
+            region.assign_advice(|| "poseidon_next_2", config.c, row + 1, || next_state.map(|state| state[2]))?,
+            region.assign_advice(|| "poseidon_next_3", config.d, row + 1, || next_state.map(|state| state[3]))?,
+        ];
+        current_state = [
+            next_state.map(|state| state[0]),
+            next_state.map(|state| state[1]),
+            next_state.map(|state| state[2]),
+            next_state.map(|state| state[3]),
+        ];
+
+        if round == TX_POSEIDON_TOTAL_ROUNDS - 1 {
+            final_state = Some(next_cells[0].clone());
+        }
+    }
+
+    final_state.ok_or(ErrorFront::Synthesis)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -513,8 +595,8 @@ where
         // The circuit hashes [sender, receiver, amount] into a single field
         // element and wires the first state word of the final permutation row
         // to the public tx_hash instance cell.
-        let tx_poseidon_constants = tx_poseidon_constants::<F>();
-        let tx_poseidon_mds = tx_poseidon_mds::<F>();
+        let poseidon_constants = poseidon_constants::<F>();
+        let poseidon_mds = poseidon_mds::<F>();
         let tx_hash_cell: AssignedCell<F, F> = layouter.assign_region(
             || "tx_hash_poseidon",
             |mut region: Region<'_, F>| {
@@ -525,10 +607,10 @@ where
                     || "poseidon_capacity",
                     config.d,
                     0,
-                    F::from_u128((TX_POSEIDON_RATE as u128) << 64),
+                    poseidon_domain_tag::<F>(TX_POSEIDON_RATE),
                 )?;
 
-                let mut current_state = [
+                let initial_state = [
                     self.witness
                         .as_ref()
                         .map(|w| bytes_to_field::<F>(&w.sender_pubkey)),
@@ -536,57 +618,16 @@ where
                         .as_ref()
                         .map(|w| bytes_to_field::<F>(&w.receiver_pubkey)),
                     self.witness.as_ref().map(|w| F::from(w.amount)),
-                    Value::known(F::from_u128((TX_POSEIDON_RATE as u128) << 64)),
+                    Value::known(poseidon_domain_tag::<F>(TX_POSEIDON_RATE)),
                 ];
-                let mut final_state = None;
-
-                for (round, round_constants) in tx_poseidon_constants.iter().enumerate() {
-                    let is_full_round = round < TX_POSEIDON_FULL_ROUNDS / 2
-                        || round >= TX_POSEIDON_FULL_ROUNDS / 2 + TX_POSEIDON_PARTIAL_ROUNDS;
-                    if is_full_round {
-                        config.s_poseidon_full.enable(&mut region, round)?;
-                    } else {
-                        config.s_poseidon_partial.enable(&mut region, round)?;
-                    }
-
-                    for (column, round_constant) in
-                        config.poseidon_rc.iter().zip(round_constants.iter())
-                    {
-                        region.assign_fixed(
-                            || "poseidon_round_constant",
-                            *column,
-                            round,
-                            || Value::known(*round_constant),
-                        )?;
-                    }
-
-                    let next_state = current_state[0]
-                        .zip(current_state[1])
-                        .zip(current_state[2])
-                        .zip(current_state[3])
-                        .map(|(((a, b), c), d)| {
-                            tx_poseidon_round([a, b, c, d], *round_constants, &tx_poseidon_mds, is_full_round)
-                        });
-
-                    let next_cells = [
-                        region.assign_advice(|| "poseidon_next_0", config.a, round + 1, || next_state.map(|state| state[0]))?,
-                        region.assign_advice(|| "poseidon_next_1", config.b, round + 1, || next_state.map(|state| state[1]))?,
-                        region.assign_advice(|| "poseidon_next_2", config.c, round + 1, || next_state.map(|state| state[2]))?,
-                        region.assign_advice(|| "poseidon_next_3", config.d, round + 1, || next_state.map(|state| state[3]))?,
-                    ];
-                    current_state = [
-                        next_state.map(|state| state[0]),
-                        next_state.map(|state| state[1]),
-                        next_state.map(|state| state[2]),
-                        next_state.map(|state| state[3]),
-                    ];
-
-                    if round == TX_POSEIDON_TOTAL_ROUNDS - 1 {
-                        final_state = Some(next_cells[0].clone());
-                    }
-                }
-
-                final_state.ok_or(ErrorFront::Synthesis)
+                assign_poseidon_permutation(
+                    &config,
+                    &mut region,
+                    0,
+                    initial_state,
+                    &poseidon_constants,
+                    &poseidon_mds,
+                )
             },
         )?;
 
@@ -607,46 +648,52 @@ where
         let root_val = bytes_to_field::<F>(&self.public.compliance_merkle_root);
 
         // ── Region 4: Merkle path for sender (C1) ────────────────────────
-        let sender_leaf = self
-            .witness
-            .as_ref()
-            .map(|w| bytes_to_field::<F>(&w.sender_pubkey));
         let sender_path: Value<Vec<F>> = self.witness.as_ref().map(|w| {
-            w.merkle_path[..MERKLE_DEPTH]
+            w.sender_merkle_siblings
                 .iter()
                 .map(|n| bytes_to_field::<F>(n))
                 .collect()
         });
+        let sender_directions = self
+            .witness
+            .as_ref()
+            .map(|w| w.sender_merkle_directions.clone());
         let sender_root_cell = assign_merkle_region::<F>(
             &config,
             &mut layouter,
             "sender_merkle",
-            sender_leaf,
+            sender_cell.clone(),
             sender_path,
+            sender_directions,
             root_val,
+            &poseidon_constants,
+            &poseidon_mds,
         )?;
 
         // Wire sender Merkle root → instance column (row MERKLE_ROOT_START).
         layouter.constrain_instance(sender_root_cell.cell(), config.instance, MERKLE_ROOT_START)?;
 
         // ── Region 5: Merkle path for receiver (C2) ──────────────────────
-        let receiver_leaf = self
-            .witness
-            .as_ref()
-            .map(|w| bytes_to_field::<F>(&w.receiver_pubkey));
         let receiver_path: Value<Vec<F>> = self.witness.as_ref().map(|w| {
-            w.merkle_path[MERKLE_DEPTH..]
+            w.receiver_merkle_siblings
                 .iter()
                 .map(|n| bytes_to_field::<F>(n))
                 .collect()
         });
+        let receiver_directions = self
+            .witness
+            .as_ref()
+            .map(|w| w.receiver_merkle_directions.clone());
         let receiver_root_cell = assign_merkle_region::<F>(
             &config,
             &mut layouter,
             "receiver_merkle",
-            receiver_leaf,
+            receiver_cell.clone(),
             receiver_path,
+            receiver_directions,
             root_val,
+            &poseidon_constants,
+            &poseidon_mds,
         )?;
 
         // Wire receiver Merkle root → instance column (same row: both paths
@@ -695,70 +742,114 @@ where
 /// Assign one Merkle path region (`MERKLE_DEPTH` rows) and return the final
 /// root cell so the caller can wire it to the instance column.
 ///
-/// Row layout (one row per tree level `i`):
+/// Row layout (one region per tree level `i`):
 ///
 /// ```text
-/// row i: a[i] = current_node
-///        b[i] = sibling (from merkle_path)
-///        c[i] = parent  = node + sibling   ← s_merkle gate
+/// row 0: a = current_node
+///        b = sibling
+///        c = direction_bit
+/// row 1: a = ordered_left   ← s_merkle constrains this ordering
+///        b = ordered_right  ← s_merkle constrains this ordering
+///        c = 0
+///        d = Poseidon domain tag for a two-element message
+/// row 1..=64: Poseidon permutation rows
 /// ```
 ///
-/// At depth `MERKLE_DEPTH - 1`, an extra anchor row is added in advice
-/// to plant the expected root value.
+/// At depth `MERKLE_DEPTH - 1`, an extra anchor row is added in advice to plant
+/// the expected root value.
 /// A `constrain_equal` between `parent_cell` and the anchor enforces
 /// that the computed root matches — regardless of the path values.
 ///
 /// The returned cell is the final `parent_cell` (= computed root).
 /// The caller wires it to the public instance column.
-fn assign_merkle_region<F: ff::PrimeField>(
+fn assign_merkle_region<F>(
     config: &ComplianceConfig,
     layouter: &mut impl Layouter<F>,
     name: &'static str,
-    leaf: Value<F>,
+    leaf: AssignedCell<F, F>,
     path: Value<Vec<F>>,
+    directions: Value<Vec<bool>>,
     expected_root: F,
-) -> Result<AssignedCell<F, F>, ErrorFront> {
-    layouter.assign_region(
-        || name,
-        |mut region: Region<'_, F>| {
-            let mut current: Value<F> = leaf;
-            let mut final_parent_cell: Option<AssignedCell<F, F>> = None;
+    poseidon_constants: &[[F; TX_POSEIDON_WIDTH]],
+    poseidon_mds: &Mds<F, TX_POSEIDON_WIDTH>,
+) -> Result<AssignedCell<F, F>, ErrorFront>
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
+    let mut current_cell = leaf;
+    let mut final_parent_cell = None;
 
-            for depth in 0..MERKLE_DEPTH {
-                config.s_merkle.enable(&mut region, depth)?;
+    for depth in 0..MERKLE_DEPTH {
+        let region_name = format!("{name}_{depth}");
+        let current_value = current_cell.value().copied();
+        let current_cell_for_region = current_cell.clone();
+        let sibling = path.as_ref().map(|p| p[depth]);
+        let direction = directions.as_ref().map(|bits| bits[depth]);
+        let parent_cell = layouter.assign_region(
+            || region_name.clone(),
+            |mut region: Region<'_, F>| {
+                config.s_merkle.enable(&mut region, 0)?;
 
-                let sibling: Value<F> = path.as_ref().map(|p| p[depth]);
+                current_cell_for_region.copy_advice(|| "node", &mut region, config.a, 0)?;
+                region.assign_advice(|| "sibling", config.b, 0, || sibling)?;
+                region.assign_advice(
+                    || "direction_bit",
+                    config.c,
+                    0,
+                    || direction.map(|is_right| if is_right { F::ONE } else { F::ZERO }),
+                )?;
 
-                // PROTOTYPE: parent = node + sibling
-                // PRODUCTION: parent = Poseidon(node, sibling)
-                let parent: Value<F> = current.zip(sibling).map(|(n, s)| n + s);
+                let ordered_left = current_value
+                    .zip(sibling)
+                    .zip(direction)
+                    .map(|((node, sibling), is_right)| if is_right { sibling } else { node });
+                let ordered_right = current_value
+                    .zip(sibling)
+                    .zip(direction)
+                    .map(|((node, sibling), is_right)| if is_right { node } else { sibling });
 
-                region.assign_advice(|| "node", config.a, depth, || current)?;
-                region.assign_advice(|| "sibling", config.b, depth, || sibling)?;
-                let parent_cell = region.assign_advice(|| "parent", config.c, depth, || parent)?;
+                region.assign_advice(|| "ordered_left", config.a, 1, || ordered_left)?;
+                region.assign_advice(|| "ordered_right", config.b, 1, || ordered_right)?;
+                region.assign_advice_from_constant(|| "merkle_padding", config.c, 1, F::ZERO)?;
+                region.assign_advice_from_constant(
+                    || "merkle_domain_tag",
+                    config.d,
+                    1,
+                    poseidon_domain_tag::<F>(2),
+                )?;
+
+                let parent_cell = assign_poseidon_permutation(
+                    config,
+                    &mut region,
+                    1,
+                    [
+                        ordered_left,
+                        ordered_right,
+                        Value::known(F::ZERO),
+                        Value::known(poseidon_domain_tag::<F>(2)),
+                    ],
+                    poseidon_constants,
+                    poseidon_mds,
+                )?;
 
                 if depth == MERKLE_DEPTH - 1 {
-                    // Assign expected_root in advice (not fixed) so the value
-                    // can vary per proof. Using fixed-column constants here
-                    // would couple VK/PK to a specific root and break proof
-                    // verification for other inputs.
                     let root_anchor = region.assign_advice(
                         || "root_anchor",
                         config.c,
-                        depth + 1,
+                        TX_POSEIDON_TOTAL_ROUNDS + 2,
                         || Value::known(expected_root),
                     )?;
                     region.constrain_equal(parent_cell.cell(), root_anchor.cell())?;
-                    final_parent_cell = Some(parent_cell);
                 }
 
-                current = parent;
-            }
+                Ok(parent_cell)
+            },
+        )?;
+        current_cell = parent_cell.clone();
+        final_parent_cell = Some(parent_cell);
+    }
 
-            // Unwrap is safe: loop always reaches MERKLE_DEPTH - 1.
-            Ok(final_parent_cell.unwrap())
-        },
-    )
+    final_parent_cell.ok_or(ErrorFront::Synthesis)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -774,23 +865,53 @@ mod tests {
 
     // ── Fixture builder ───────────────────────────────────────────────────
     //
-    // Construction strategy: work entirely in field arithmetic.
-    //
-    // 1. Choose sender_pubkey, receiver_pubkey as raw byte arrays.
-    // 2. Compute their field elements via bytes_to_field — this is the ground
-    //    truth the circuit will use internally.
-    // 3. Derive tx_hash bytes from the same Poseidon( sender, receiver, amount )
-    //    helper used by the circuit's C3 path.
-    // 4. For each Merkle path: choose MERKLE_DEPTH-1 arbitrary sibling byte
-    //    arrays, compute the running field sum, then derive the final sibling
-    //    as (target_root_f - running) encoded back into bytes.
-    // 5. Encode compliance_merkle_root as the bytes of target_root_f.
-    //
-    // This way the fixture is defined by field values, not byte sums, and
-    // changing MERKLE_DEPTH or the address bytes cannot cause silent overflow.
     fn field_to_bytes(f: Fr) -> [u8; 32] {
-        // Fr::to_repr() gives the canonical little-endian byte representation.
         f.to_repr().into()
+    }
+
+    fn build_merkle_tree(leaves: Vec<Fr>) -> Vec<Vec<Fr>> {
+        let mut levels = vec![leaves];
+
+        while levels.last().expect("non-empty tree").len() > 1 {
+            let next_level = levels
+                .last()
+                .expect("non-empty tree")
+                .chunks_exact(2)
+                .map(|pair| merkle_parent_hash_fields(pair[0], pair[1]))
+                .collect::<Vec<_>>();
+            levels.push(next_level);
+        }
+
+        levels
+    }
+
+    fn extract_merkle_path(levels: &[Vec<Fr>], mut leaf_index: usize) -> (Vec<[u8; 32]>, Vec<bool>) {
+        let mut siblings = Vec::with_capacity(MERKLE_DEPTH);
+        let mut directions = Vec::with_capacity(MERKLE_DEPTH);
+
+        for nodes in levels.iter().take(MERKLE_DEPTH) {
+            let is_right = leaf_index % 2 == 1;
+            siblings.push(field_to_bytes(nodes[leaf_index ^ 1]));
+            directions.push(is_right);
+            leaf_index /= 2;
+        }
+
+        (siblings, directions)
+    }
+
+    fn compute_merkle_root(leaf: Fr, siblings: &[[u8; 32]], directions: &[bool]) -> Fr {
+        siblings
+            .iter()
+            .zip(directions.iter())
+            .fold(leaf, |current, (sibling, is_right)| {
+                let sibling_f = bytes_to_field::<Fr>(sibling);
+                let (left, right) = if *is_right {
+                    (sibling_f, current)
+                } else {
+                    (current, sibling_f)
+                };
+                merkle_parent_hash_fields(left, right)
+            })
     }
 
     fn make_fixture() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
@@ -801,56 +922,41 @@ mod tests {
         let amount: u64 = 999;
         let block_height: u64 = 1_000_000;
 
-        // Ground-truth field elements for sender and receiver.
         let sender_f: Fr = bytes_to_field(&sender_pubkey);
         let receiver_f: Fr = bytes_to_field(&receiver_pubkey);
-
         let tx_hash_f: Fr = tx_hash_field_from_inputs(&sender_pubkey, &receiver_pubkey, amount);
         let tx_hash: [u8; 32] = field_to_bytes(tx_hash_f);
 
-        // Arbitrary but fixed sibling bytes for levels 0..MERKLE_DEPTH-2.
-        // Any values work — we solve for the last sibling in field arithmetic.
-        let common_sibling: [u8; 32] = {
-            let mut a = [0u8; 32];
-            a[0] = 0x07;
-            a
-        };
-        let common_f: Fr = bytes_to_field(&common_sibling);
+        let sender_index = 3usize;
+        let receiver_index = 10usize;
+        let mut leaves = (0..(1 << MERKLE_DEPTH))
+            .map(|i| Fr::from((i as u64) + 100))
+            .collect::<Vec<_>>();
+        leaves[sender_index] = sender_f;
+        leaves[receiver_index] = receiver_f;
 
-        // target_root_f: arbitrary field element that both paths will converge to.
-        // Chosen as a fixed constant independent of address values.
-        let target_root_f: Fr = Fr::from(0xDEAD_BEEF_u64);
+        let tree = build_merkle_tree(leaves);
+        let root_f = *tree.last().expect("root level exists").first().expect("root exists");
+        let (sender_merkle_siblings, sender_merkle_directions) =
+            extract_merkle_path(&tree, sender_index);
+        let (receiver_merkle_siblings, receiver_merkle_directions) =
+            extract_merkle_path(&tree, receiver_index);
 
-        // Build a Merkle path for one side.
-        // After (MERKLE_DEPTH-1) common siblings the running field value is:
-        //   running = leaf_f + (MERKLE_DEPTH-1) * common_f
-        // The last sibling must satisfy: running + last_sib_f = target_root_f
-        //   → last_sib_f = target_root_f - running
-        let make_path = |leaf_f: Fr| -> Vec<[u8; 32]> {
-            let running: Fr = leaf_f + common_f * Fr::from(MERKLE_DEPTH as u64 - 1);
-            let last_sib_f: Fr = target_root_f - running;
+        assert_eq!(
+            compute_merkle_root(sender_f, &sender_merkle_siblings, &sender_merkle_directions),
+            root_f
+        );
+        assert_eq!(
+            compute_merkle_root(
+                receiver_f,
+                &receiver_merkle_siblings,
+                &receiver_merkle_directions
+            ),
+            root_f
+        );
 
-            let mut path = vec![common_sibling; MERKLE_DEPTH - 1];
-            path.push(field_to_bytes(last_sib_f));
-            path
-        };
-
-        let sender_path = make_path(sender_f);
-        let receiver_path = make_path(receiver_f);
-
-        // Verify both paths in field arithmetic — no byte-sum guesswork.
-        let check_path = |leaf_f: Fr, path: &[[u8; 32]]| -> Fr {
-            path.iter()
-                .fold(leaf_f, |cur, sib| cur + bytes_to_field::<Fr>(sib))
-        };
-        assert_eq!(check_path(sender_f, &sender_path), target_root_f);
-        assert_eq!(check_path(receiver_f, &receiver_path), target_root_f);
-
-        let compliance_merkle_root: [u8; 32] = field_to_bytes(target_root_f);
+        let compliance_merkle_root: [u8; 32] = field_to_bytes(root_f);
         let oracle_pubkey_hash: [u8; 32] = field_to_bytes(Fr::from(0xA11CE_u64));
-
-        let mut merkle_path = sender_path;
-        merkle_path.extend_from_slice(&receiver_path);
 
         let public = PublicInputs {
             tx_hash,
@@ -864,7 +970,10 @@ mod tests {
             amount,
             sender_oracle_sig,
             receiver_oracle_sig,
-            merkle_path,
+            sender_merkle_siblings,
+            sender_merkle_directions,
+            receiver_merkle_siblings,
+            receiver_merkle_directions,
         };
         let circuit = ComplianceCircuit {
             public: public.clone(),
@@ -876,7 +985,7 @@ mod tests {
         // because no constrain_instance call touches them.
         let mut instance_col = vec![Fr::ZERO; NUM_INSTANCE_ROWS];
         instance_col[TX_HASH_START] = tx_hash_f;
-        instance_col[MERKLE_ROOT_START] = target_root_f;
+        instance_col[MERKLE_ROOT_START] = root_f;
         instance_col[ORACLE_PUBKEY_HASH_START] = bytes_to_field(&public.oracle_pubkey_hash);
         instance_col[BLOCK_HEIGHT_ROW] = Fr::from(block_height);
 
@@ -887,8 +996,7 @@ mod tests {
     #[test]
     fn test_valid_witness_passes() {
         let (circuit, instance) = make_fixture();
-        // k = 8 → 2^8 = 256 rows; sufficient for MERKLE_DEPTH = 4.
-        let prover = MockProver::<Fr>::run(8, &circuit, instance).expect("MockProver::run failed");
+        let prover = MockProver::<Fr>::run(10, &circuit, instance).expect("MockProver::run failed");
         prover
             .verify()
             .expect("Valid witness should satisfy all constraints");
@@ -904,7 +1012,7 @@ mod tests {
         let (circuit, mut instance) = make_fixture();
         // Corrupt the tx_hash instance value.
         instance[0][TX_HASH_START] += Fr::from(1u64);
-        let prover = MockProver::<Fr>::run(8, &circuit, instance).expect("MockProver::run failed");
+        let prover = MockProver::<Fr>::run(10, &circuit, instance).expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),
             "Wrong tx_hash should cause verify() to fail"
@@ -918,7 +1026,7 @@ mod tests {
             w.amount += 1;
             w
         });
-        let prover = MockProver::<Fr>::run(8, &circuit, instance).expect("MockProver::run failed");
+        let prover = MockProver::<Fr>::run(10, &circuit, instance).expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),
             "Changing amount without updating tx_hash should fail Poseidon binding"
@@ -934,30 +1042,39 @@ mod tests {
     fn test_wrong_merkle_root_fails() {
         let (circuit, mut instance) = make_fixture();
         instance[0][MERKLE_ROOT_START] += Fr::from(1u64);
-        let prover = MockProver::<Fr>::run(8, &circuit, instance).expect("MockProver::run failed");
+        let prover = MockProver::<Fr>::run(10, &circuit, instance).expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),
             "Wrong merkle_root should cause verify() to fail"
         );
     }
 
-    // ── Test 4: wrong merkle_path in witness → verify() fails ────────────
-    //
-    // The sender's first sibling is changed so the computed Merkle root no
-    // longer equals the committed compliance_merkle_root.
-    // The root_anchor constrain_equal in assign_merkle_region fires.
+    // ── Test 4: wrong Merkle sibling in witness → verify() fails ─────────
     #[test]
-    fn test_wrong_merkle_path_fails() {
+    fn test_wrong_merkle_sibling_fails() {
         let (mut circuit, instance) = make_fixture();
         circuit.witness = circuit.witness.map(|mut w| {
-            // Flip one byte in the first sender sibling → wrong path root.
-            w.merkle_path[0][0] ^= 0xFF;
+            w.sender_merkle_siblings[0][0] ^= 0xFF;
             w
         });
-        let prover = MockProver::<Fr>::run(8, &circuit, instance).expect("MockProver::run failed");
+        let prover = MockProver::<Fr>::run(10, &circuit, instance).expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),
-            "Wrong Merkle path should cause verify() to fail"
+            "Wrong Merkle sibling should cause verify() to fail"
+        );
+    }
+
+    #[test]
+    fn test_wrong_merkle_direction_bit_fails() {
+        let (mut circuit, instance) = make_fixture();
+        circuit.witness = circuit.witness.map(|mut w| {
+            w.sender_merkle_directions[0] = !w.sender_merkle_directions[0];
+            w
+        });
+        let prover = MockProver::<Fr>::run(10, &circuit, instance).expect("MockProver::run failed");
+        assert!(
+            prover.verify().is_err(),
+            "Wrong Merkle direction bit should cause verify() to fail"
         );
     }
 }

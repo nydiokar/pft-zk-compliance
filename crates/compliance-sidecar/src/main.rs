@@ -286,9 +286,16 @@ mod inner {
         pub oracle_pubkey_hash: String,
         /// Block height of the compliance snapshot.
         pub block_height: u64,
-        /// Hex-encoded sibling hashes for Merkle membership proof.
-        /// Must contain exactly `2 * MERKLE_DEPTH` entries (sender path then receiver path).
-        pub merkle_path: Vec<String>,
+        /// Hex-encoded sender Merkle sibling hashes.
+        /// Must contain exactly `MERKLE_DEPTH` entries.
+        pub sender_merkle_siblings: Vec<String>,
+        /// Sender per-level direction bits. `false` means current node is left.
+        pub sender_merkle_directions: Vec<bool>,
+        /// Hex-encoded receiver Merkle sibling hashes.
+        /// Must contain exactly `MERKLE_DEPTH` entries.
+        pub receiver_merkle_siblings: Vec<String>,
+        /// Receiver per-level direction bits. `false` means current node is left.
+        pub receiver_merkle_directions: Vec<bool>,
     }
 
     /// JSON response written back to the daemon by the sidecar.
@@ -329,7 +336,10 @@ mod inner {
         pub(crate) compliance_merkle_root: [u8; 32],
         pub(crate) oracle_pubkey_hash: [u8; 32],
         pub(crate) block_height: u64,
-        pub(crate) merkle_path: Vec<[u8; 32]>,
+        pub(crate) sender_merkle_siblings: Vec<[u8; 32]>,
+        pub(crate) sender_merkle_directions: Vec<bool>,
+        pub(crate) receiver_merkle_siblings: Vec<[u8; 32]>,
+        pub(crate) receiver_merkle_directions: Vec<bool>,
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -552,7 +562,10 @@ mod inner {
             amount: req.amount,
             sender_oracle_sig: req.sender_oracle_sig,
             receiver_oracle_sig: req.receiver_oracle_sig,
-            merkle_path: req.merkle_path,
+            sender_merkle_siblings: req.sender_merkle_siblings,
+            sender_merkle_directions: req.sender_merkle_directions,
+            receiver_merkle_siblings: req.receiver_merkle_siblings,
+            receiver_merkle_directions: req.receiver_merkle_directions,
         };
         let circuit = ComplianceCircuit {
             public: public.clone(),
@@ -651,18 +664,42 @@ mod inner {
             decode_hex_32(&req.compliance_merkle_root, "compliance_merkle_root")?;
         let oracle_pubkey_hash = decode_hex_32(&req.oracle_pubkey_hash, "oracle_pubkey_hash")?;
 
-        let expected_path_len = 2 * MERKLE_DEPTH;
-        if req.merkle_path.len() != expected_path_len {
+        if req.sender_merkle_siblings.len() != MERKLE_DEPTH {
             return Err(format!(
-                "merkle_path must have {expected_path_len} entries (got {})",
-                req.merkle_path.len()
+                "sender_merkle_siblings must have {MERKLE_DEPTH} entries (got {})",
+                req.sender_merkle_siblings.len()
             ));
         }
-        let merkle_path = req
-            .merkle_path
+        if req.sender_merkle_directions.len() != MERKLE_DEPTH {
+            return Err(format!(
+                "sender_merkle_directions must have {MERKLE_DEPTH} entries (got {})",
+                req.sender_merkle_directions.len()
+            ));
+        }
+        if req.receiver_merkle_siblings.len() != MERKLE_DEPTH {
+            return Err(format!(
+                "receiver_merkle_siblings must have {MERKLE_DEPTH} entries (got {})",
+                req.receiver_merkle_siblings.len()
+            ));
+        }
+        if req.receiver_merkle_directions.len() != MERKLE_DEPTH {
+            return Err(format!(
+                "receiver_merkle_directions must have {MERKLE_DEPTH} entries (got {})",
+                req.receiver_merkle_directions.len()
+            ));
+        }
+
+        let sender_merkle_siblings = req
+            .sender_merkle_siblings
             .iter()
             .enumerate()
-            .map(|(i, s)| decode_hex_32_unchecked(s, &format!("merkle_path[{i}]")))
+            .map(|(i, s)| decode_hex_32_unchecked(s, &format!("sender_merkle_siblings[{i}]")))
+            .collect::<Result<_, _>>()?;
+        let receiver_merkle_siblings = req
+            .receiver_merkle_siblings
+            .iter()
+            .enumerate()
+            .map(|(i, s)| decode_hex_32_unchecked(s, &format!("receiver_merkle_siblings[{i}]")))
             .collect::<Result<_, _>>()?;
 
         Ok(NormalizedProofRequest {
@@ -675,7 +712,10 @@ mod inner {
             compliance_merkle_root,
             oracle_pubkey_hash,
             block_height: req.block_height,
-            merkle_path,
+            sender_merkle_siblings,
+            sender_merkle_directions: req.sender_merkle_directions,
+            receiver_merkle_siblings,
+            receiver_merkle_directions: req.receiver_merkle_directions,
         })
     }
 
@@ -759,8 +799,9 @@ mod tests {
     use super::inner::{normalize_request, ProofRequest};
     use compliance_circuit::{
         circuit::{
-            tx_hash_field_from_inputs, PublicInputs, Witness, BLOCK_HEIGHT_ROW, MERKLE_DEPTH,
-            MERKLE_ROOT_START, NUM_INSTANCE_ROWS, ORACLE_PUBKEY_HASH_START, TX_HASH_START,
+            merkle_parent_hash_fields, tx_hash_field_from_inputs, PublicInputs, Witness,
+            BLOCK_HEIGHT_ROW, MERKLE_DEPTH, MERKLE_ROOT_START, NUM_INSTANCE_ROWS,
+            ORACLE_PUBKEY_HASH_START, TX_HASH_START,
         },
         ComplianceCircuit,
     };
@@ -796,7 +837,45 @@ mod tests {
         })
     }
 
-    /// Build a minimal but valid circuit + instance column for k=8.
+    fn field_to_bytes(f: Fr) -> [u8; 32] {
+        f.to_repr().into()
+    }
+
+    fn binary_merkle_parent(left: Fr, right: Fr) -> Fr {
+        merkle_parent_hash_fields(left, right)
+    }
+
+    fn build_merkle_tree(leaves: Vec<Fr>) -> Vec<Vec<Fr>> {
+        let mut levels = vec![leaves];
+
+        while levels.last().expect("non-empty tree").len() > 1 {
+            let next_level = levels
+                .last()
+                .expect("non-empty tree")
+                .chunks_exact(2)
+                .map(|pair| binary_merkle_parent(pair[0], pair[1]))
+                .collect::<Vec<_>>();
+            levels.push(next_level);
+        }
+
+        levels
+    }
+
+    fn extract_merkle_path(levels: &[Vec<Fr>], mut leaf_index: usize) -> (Vec<[u8; 32]>, Vec<bool>) {
+        let mut siblings = Vec::with_capacity(MERKLE_DEPTH);
+        let mut directions = Vec::with_capacity(MERKLE_DEPTH);
+
+        for nodes in levels.iter().take(MERKLE_DEPTH) {
+            let is_right = leaf_index % 2 == 1;
+            siblings.push(field_to_bytes(nodes[leaf_index ^ 1]));
+            directions.push(is_right);
+            leaf_index /= 2;
+        }
+
+        (siblings, directions)
+    }
+
+    /// Build a minimal but valid circuit + instance column for k=10.
     fn make_circuit_and_instances() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
         let sender_pubkey = [0x01u8; 32];
         let receiver_pubkey = [0x02u8; 32];
@@ -805,33 +884,24 @@ mod tests {
         let amount: u64 = 42;
         let block_height: u64 = 1;
 
-        // Derive field elements so the circuit's Poseidon tx-hash and additive
-        // Merkle prototype constraints are both satisfied.
         let sender_f = bytes_to_field_fr(&sender_pubkey);
         let receiver_f = bytes_to_field_fr(&receiver_pubkey);
         let tx_hash_f = tx_hash_field_from_inputs::<Fr>(&sender_pubkey, &receiver_pubkey, amount);
         let tx_hash: [u8; 32] = tx_hash_f.to_repr().into();
 
-        let common_sib: [u8; 32] = {
-            let mut a = [0u8; 32];
-            a[0] = 0x07;
-            a
-        };
-        let common_f = bytes_to_field_fr(&common_sib);
-        let root_f = Fr::from(0xDEAD_BEEF_u64);
-
-        let make_path = |leaf_f: Fr| -> Vec<[u8; 32]> {
-            let running = leaf_f + common_f * Fr::from(MERKLE_DEPTH as u64 - 1);
-            let last: [u8; 32] = (root_f - running).to_repr().into();
-            let mut p = vec![common_sib; MERKLE_DEPTH - 1];
-            p.push(last);
-            p
-        };
-
-        let merkle_path: Vec<[u8; 32]> = make_path(sender_f)
-            .into_iter()
-            .chain(make_path(receiver_f))
-            .collect();
+        let sender_index = 3usize;
+        let receiver_index = 10usize;
+        let mut leaves = (0..(1 << MERKLE_DEPTH))
+            .map(|i| Fr::from((i as u64) + 100))
+            .collect::<Vec<_>>();
+        leaves[sender_index] = sender_f;
+        leaves[receiver_index] = receiver_f;
+        let tree = build_merkle_tree(leaves);
+        let root_f = *tree.last().expect("root exists").first().expect("root element exists");
+        let (sender_merkle_siblings, sender_merkle_directions) =
+            extract_merkle_path(&tree, sender_index);
+        let (receiver_merkle_siblings, receiver_merkle_directions) =
+            extract_merkle_path(&tree, receiver_index);
 
         let compliance_merkle_root: [u8; 32] = root_f.to_repr().into();
         let oracle_pubkey_hash: [u8; 32] = Fr::from(0xA11CE_u64).to_repr().into();
@@ -848,7 +918,10 @@ mod tests {
             amount,
             sender_oracle_sig,
             receiver_oracle_sig,
-            merkle_path,
+            sender_merkle_siblings,
+            sender_merkle_directions,
+            receiver_merkle_siblings,
+            receiver_merkle_directions,
         };
         let circuit = ComplianceCircuit {
             public: public.clone(),
@@ -869,11 +942,11 @@ mod tests {
         (circuit, vec![instance_col])
     }
 
-    /// Generates real params + pk for k=8, proves, verifies. Asserts valid proof passes.
+    /// Generates real params + pk for k=10, proves, verifies. Asserts valid proof passes.
     /// Then flips one byte in the proof and asserts verify_proof_multi returns false.
     #[test]
     fn test_verify_proof_multi_valid_and_corrupted() {
-        let k: u32 = 8;
+        let k: u32 = 10;
         let params = ParamsKZG::<Bn256>::setup(k, OsRng);
 
         let dummy = ComplianceCircuit {
@@ -935,7 +1008,6 @@ mod tests {
     }
 
     fn valid_request_json() -> serde_json::Value {
-        let merkle_entry = format!("0x{}", hex::encode([0x07u8; 32]));
         let tx_hash = {
             let mut bytes = [0u8; 32];
             bytes[0] = 0x11;
@@ -961,6 +1033,8 @@ mod tests {
             bytes[0] = 0x13;
             bytes
         };
+        let sender_sibling = format!("0x{}", hex::encode([0x07u8; 32]));
+        let receiver_sibling = format!("0x{}", hex::encode([0x08u8; 32]));
         json!({
             "version": 1,
             "tx_hash": format!("0x{}", hex::encode(tx_hash)),
@@ -972,7 +1046,10 @@ mod tests {
             "compliance_merkle_root": format!("0x{}", hex::encode(compliance_merkle_root)),
             "oracle_pubkey_hash": format!("0x{}", hex::encode(oracle_pubkey_hash)),
             "block_height": 42,
-            "merkle_path": vec![merkle_entry; 2 * MERKLE_DEPTH],
+            "sender_merkle_siblings": vec![sender_sibling; MERKLE_DEPTH],
+            "sender_merkle_directions": vec![false, true, false, true],
+            "receiver_merkle_siblings": vec![receiver_sibling; MERKLE_DEPTH],
+            "receiver_merkle_directions": vec![true, false, true, false],
         })
     }
 
@@ -990,6 +1067,9 @@ mod tests {
         assert_eq!(normalized.receiver_pubkey, expected_receiver);
         assert_eq!(normalized.sender_oracle_sig, [0x44u8; 64]);
         assert_eq!(normalized.receiver_oracle_sig, [0x55u8; 64]);
+        assert_eq!(normalized.sender_merkle_siblings.len(), MERKLE_DEPTH);
+        assert_eq!(normalized.sender_merkle_directions, vec![false, true, false, true]);
+        assert_eq!(normalized.receiver_merkle_directions, vec![true, false, true, false]);
     }
 
     #[test]
@@ -1027,6 +1107,20 @@ mod tests {
         let err = normalize_request(req).expect_err("bad oracle field should fail");
         assert!(
             err.contains("oracle_pubkey_hash: expected 32 bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_merkle_direction_length_fails_cleanly() {
+        let mut raw = valid_request_json();
+        raw["sender_merkle_directions"] = json!([false, true]);
+
+        let req: ProofRequest =
+            serde_json::from_str(&raw.to_string()).expect("schema should still deserialize");
+        let err = normalize_request(req).expect_err("bad merkle directions should fail");
+        assert!(
+            err.contains("sender_merkle_directions must have"),
             "unexpected error: {err}"
         );
     }

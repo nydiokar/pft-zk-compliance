@@ -9,7 +9,7 @@
 | Status | Task | Scope | Notes |
 |:------:|:-----|:-----:|:------|
 | ✅ | **[ZK-0] Repo scaffold** | S | Workspace Cargo.toml, compliance-circuit + compliance-sidecar crates, .gitignore, git init. `cargo check` passes. |
-| ✅ | **[ZK-1] Circuit I/O definition** | M | Initial circuit/public input shape documented. `docs/SPEC.md` v1.1 is the canonical source for the production witness/public-input model. |
+| ✅ | **[ZK-1] Circuit I/O definition** | M | Initial circuit/public input shape documented. `docs/SPEC.md` is the target architecture; `.ai/CONTEXT.md` records approved implementation deltas when the workspace is intentionally staged. |
 | ✅ | **[ZK-2] Sidecar IPC schema** | S | JSON-over-socket request/response schema. ProofRequest + ProofResponse structs in `crates/compliance-sidecar/src/main.rs`. Documented in §3 of SPEC.md. |
 | ✅ | **[ZK-3] Consensus fallback design** | M | Timeout → quarantine → BFT quorum vote. Pessimistic mode on sidecar crash. 2f+1 rejection receipt logic. Documented in §4 of SPEC.md. |
 | ✅ | **[ZK-4] SPEC.md published** | S | Full architecture spec published to GitHub Gist. |
@@ -21,7 +21,7 @@
 | ✅ | **[ZK-10] Proof verification in sidecar** | M | `verify_proof_multi` (SHPLONK + Blake2b) called immediately after `create_proof`. VK loaded into `ProverState` at startup via `vk_read`. Verify failure → `"non_compliant"` status; internal errors → `"error"`. `serve` now takes `--vk` flag. `cargo check` passes. |
 | ✅ | **[ZK-11] Spec v1.1 pubkey-model alignment** | M | Rust circuit and sidecar IPC now use the spec-defined XRPL ed25519 pubkey model (`[u8; 32]`) plus oracle-signature/oracle-pubkey-hash fields. Validation rejects malformed pubkeys/oracle fields before proving. `cargo test -p compliance-circuit`, `cargo test -p compliance-sidecar`, and combined crate tests pass in a normal local environment. |
 | ✅ | **[ZK-12] Poseidon hash gates** | L | C3 transaction binding now uses Poseidon over `[sender_pubkey, receiver_pubkey, amount]` in the Rust circuit. Public-input wiring stays at the folded `TX_HASH_START` field element. Added focused tests for valid witnesses, tampered public `tx_hash`, and tampered witness `amount`. Full `cargo test` passes. |
-| [ ] | **[ZK-13] Binary Merkle chip** | L | Replace prototype additive Merkle path with proper binary Merkle chip. Pair with ZK-12 (Poseidon at each level). |
+| [ ] | **[ZK-13] Binary Merkle chip** | L | Replace prototype additive sender/receiver Merkle paths with fixed-depth binary Poseidon paths to the shared compliance root. Add sibling + direction-bit witness handling and focused pass/fail tests. |
 | [ ] | **[ZK-14] Lookup table range check** | S | Replace tautological range gate with a proper lookup table constraining `amount` to u64. |
 | [ ] | **[ZK-15] postfiatd IPC hook** | L | C++ side of the socket interface in postfiatd. Calls sidecar before forwarding tx to RPCA consensus. Depends on ZK-9/10/11 being stable. **When implementing: add `tokio::sync::Semaphore` in `ProverState` to cap concurrent `spawn_blocking` proof jobs — each proof is ~100-300 MB at k=8, unbounded concurrency under burst load causes OOM. Limit should be a `--max-concurrent-proofs` CLI flag sized against real circuit memory at production k.** Integration target remains the Post Fiat `postfiatd` validator daemon described in `docs/SPEC.md`. |
 | [ ] | **[ZK-16] Pin halo2 git dep** | S | Add `rev = "<commit>"` to halo2_proofs git dep in all Cargo.toml files. Supply-chain hygiene before any production deployment. |
@@ -37,9 +37,10 @@
 | AD-3 | Sidecar as separate process | Crash isolation — sidecar failure doesn't crash validator. CPU-heavy proof gen doesn't block RPCA event loop | In-process: simpler but couples lifecycles |
 | AD-4 | JSON-over-socket IPC | Simple, debuggable, language-agnostic (C++ postfiatd ↔ Rust sidecar) | gRPC: overkill for single-machine IPC; raw binary: harder to debug |
 | AD-5 | ZK as complement to LLM OFAC screening | Post Fiat already has LLM-delegated compliance. ZK adds cryptographic provability on top, not a replacement | Replace LLM screening: would remove existing functionality |
-| AD-6 | Gate degree target ≤ 4 | Leaves headroom under PLONK degree bound of 8. Poseidon gate is degree 3, Merkle gate degree 4 | Higher degree: risks constraint system errors |
+| AD-6 | Gate degree target ≤ 5 | Leaves headroom under PLONK degree bound of 8 while accommodating Ed25519 verification at degree 5. Poseidon remains degree 3 and the Merkle gate degree 4 | Higher degree: risks constraint system errors |
 | AD-7 | BN254 Fr over Pasta Fp | `ParamsKZG<Bn256>` requires `Circuit<Fr>`. ComplianceCircuit is generic over `F: PrimeField` so zero gate logic changed | Pasta: incompatible with KZG commitment scheme |
 | AD-8 | `compress_selectors = true` | Must be consistent across keygen / prove / verify. Chosen at keygen and locked in | false: wastes constraint columns |
+| AD-9 | Two per-party Merkle proofs to one shared root | Matches the current circuit decomposition and keeps membership statements local to each pubkey while sharing the same compliance snapshot root | Single combined sender/receiver leaf: couples witness semantics unnecessarily and diverges from current implementation path |
 
 ---
 
@@ -70,11 +71,11 @@
 
 - **[ZK-9 done]** `run_circuit()` uses `create_proof` (SHPLONK + Blake2b). `serve` loads `.pk` + `.params` at startup via `pk_read` / `ParamsKZG::read`. `cargo check --target x86_64-unknown-linux-gnu` passes.
 - **[ZK-10 done]** `verify_proof_multi` called after `create_proof` in `run_circuit`. VK loaded at startup via `vk_read` into `ProverState`. `serve --vk` flag added. Verify failure returns `"non_compliant"`; prover/decode errors return `"error"`. `cargo check` passes.
-- **[source of truth]** `docs/SPEC.md` v1.1 is the canonical target architecture. If `.ai/CONTEXT.md`, older circuit docs, or code disagree, update them to match the spec unless there is an explicit newer design decision recorded.
+- **[source of truth]** `docs/SPEC.md` is the target architecture. `.ai/CONTEXT.md` is the implementation-status ledger and may record approved deltas while the Rust workspace is moved toward the spec in stages. If code diverges from both, update docs or code so one of them explicitly explains the delta.
 - **[ZK-11 done]** Rust IPC/circuit boundary now uses `sender_pubkey` / `receiver_pubkey` (`[u8; 32]`) plus `sender_oracle_sig` / `receiver_oracle_sig` (`[u8; 64]`) and public `oracle_pubkey_hash`. Validation rejects malformed pubkey/oracle-field payloads before proving begins.
 - **[open]** PSE halo2 git dep is unpinned (`git = "..."` without a rev). Must pin to a specific commit before any production deployment.
 - **[ZK-12 done]** C3 transaction binding no longer uses the prototype linear gate. It now enforces a Poseidon-based hash path in `crates/compliance-circuit/src/circuit.rs`. The sidecar's proof-building test fixture was updated to derive the same `tx_hash` field value via the shared helper.
-- **[open, by design]** Merkle membership still uses prototype additive hashing (`node + sibling = parent`) until ZK-13. That path is not yet cryptographically collision-resistant. The remaining substitution is annotated inline in `circuit.rs` with `PROTOTYPE:` / `PRODUCTION:` comments.
+- **[open, by design]** Merkle membership still uses prototype additive hashing (`node + sibling = parent`) until ZK-13. The approved replacement is two fixed-depth binary Poseidon paths, one for sender and one for receiver, each carrying sibling nodes plus direction bits and converging to the same public `compliance_merkle_root`.
 - **[open, by design]** Instance column wires one folded field element per public input. Production circuit would wire all 32 individual byte cells to match the full `[u8; 32]` layout in `docs/circuit_io.md`.
 - **[open]** `postfiatd` is C++ (rippled fork). No C++ changes are needed until ZK-15 (IPC hook).
 - **[platform]** Unix socket listener is Linux-only (`cfg(unix)`). Build/type-check on Windows with `cargo check --target x86_64-unknown-linux-gnu -p compliance-sidecar`.

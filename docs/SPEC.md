@@ -119,19 +119,44 @@ They constitute the zero-knowledge witness.
 | `amount` | `u64` | Transaction amount in drops |
 | `sender_oracle_sig` | `[u8; 64]` | Ed25519 signature from compliance oracle over `Poseidon(sender_pubkey)` |
 | `receiver_oracle_sig` | `[u8; 64]` | Ed25519 signature from compliance oracle over `Poseidon(receiver_pubkey)` |
-| `merkle_path` | `Vec<[u8; 32]>` | Sibling hashes confirming oracle-signed pubkeys are in the compliance tree (depth 20) |
+| `sender_merkle_siblings` | `Vec<[u8; 32]>` | Sender Merkle sibling nodes (depth 20) |
+| `sender_merkle_directions` | `Vec<bool>` | Sender per-level position bits (`false = current node is left`, `true = current node is right`) |
+| `receiver_merkle_siblings` | `Vec<[u8; 32]>` | Receiver Merkle sibling nodes (depth 20) |
+| `receiver_merkle_directions` | `Vec<bool>` | Receiver per-level position bits (`false = current node is left`, `true = current node is right`) |
 
 **Oracle signature model:** The Post Fiat compliance oracle (currently the
 LLM-based OFAC screener) signs each pubkey it has cleared: `sig = oracle_sign(Poseidon(pubkey))`.
 The ZK circuit proves the prover holds valid oracle signatures for both sender
-and receiver — without revealing the pubkeys, the signatures, or the Merkle path
-to any verifier.
+and receiver — without revealing the pubkeys, the signatures, or the Merkle
+paths to any verifier.
 
 Merkle tree depth 20 supports up to **~1M cleared pubkeys**.
 
+### 2.2.1 Implementation Delta (Current Rust Workspace)
+
+The Rust workspace is being shipped iteratively. The target architecture in this
+spec is the production direction, but some crates may temporarily lag while a
+specific task is in progress.
+
+Approved Merkle direction for this repo:
+
+- The circuit proves **two independent memberships** against the same public
+  `compliance_merkle_root`: one for `sender_pubkey`, one for `receiver_pubkey`.
+- Each path is a **fixed-depth binary path** using Poseidon for parent hashing
+  at every tree level.
+- Each path requires both sibling nodes and per-level left/right direction bits.
+- The older additive placeholder (`node + sibling = parent`) is prototype-only
+  and must be removed as part of ZK-13.
+
+Temporary implementation note:
+
+- Before ZK-13 lands, the Rust circuit may still expose a flattened
+  `merkle_path` witness containing concatenated sibling nodes only. That shape
+  is not the intended production model.
+
 ### 2.3 Circuit Constraints
 
-The circuit enforces four constraints simultaneously:
+The circuit enforces five constraints simultaneously:
 
 **C1 — Sender oracle signature valid:**
 ```
@@ -151,32 +176,44 @@ Ed25519Verify(
 ) = 1
 ```
 
-**C3 — Both pubkeys present in compliance Merkle tree:**
+**C3 — Sender pubkey present in compliance Merkle tree:**
 ```
 MerkleVerify(
     root = compliance_merkle_root,
-    leaf = Poseidon(sender_pubkey ‖ receiver_pubkey),
-    path = merkle_path[0..depth]
+    leaf = Poseidon(sender_pubkey),
+    siblings = sender_merkle_siblings[0..depth],
+    directions = sender_merkle_directions[0..depth]
 ) = 1
 ```
 
-**C4 — Transaction hash binding:**
+**C4 — Receiver pubkey present in compliance Merkle tree:**
+```
+MerkleVerify(
+    root = compliance_merkle_root,
+    leaf = Poseidon(receiver_pubkey),
+    siblings = receiver_merkle_siblings[0..depth],
+    directions = receiver_merkle_directions[0..depth]
+) = 1
+```
+
+**C5 — Transaction hash binding:**
 ```
 Poseidon(sender_pubkey ‖ receiver_pubkey ‖ amount) = tx_hash
 ```
 
-C4 prevents reusing a valid proof for a different transaction.
-C1+C2 ensure the oracle actually cleared both parties — Merkle membership
-alone (C3) is insufficient because the Merkle tree could be stale; the oracle
+C5 prevents reusing a valid proof for a different transaction.
+C1+C2 ensure the oracle actually cleared both parties, while C3+C4 prove those
+same parties are members of the published compliance snapshot. Merkle membership
+alone is insufficient because the Merkle tree could be stale; the oracle
 signature carries a freshness guarantee via oracle key rotation.
 
 ### 2.4 Gate Architecture
 
 | Gate | Constraints | Max degree |
 |---|---|---|
-| Poseidon hash gate | C3 leaf hash, C4 tx binding | 3 |
+| Poseidon hash gate | C3/C4 leaf hashing, C5 tx binding, Merkle parent hashing | 3 |
 | Ed25519 verify gate | C1, C2 oracle sig verification | 5 |
-| Merkle path gate | C3 membership (one level per row) | 4 |
+| Merkle path gate | C3/C4 membership (one level per row) | 4 |
 | Range check (lookup) | `amount` fits in u64 | 2 |
 
 Target maximum gate degree: **5** (within the PLONK degree bound of 8).
@@ -197,9 +234,12 @@ pub struct ComplianceCircuit {
     pub sender_pubkey:      Value<[u8; 32]>,
     pub receiver_pubkey:    Value<[u8; 32]>,
     pub amount:             Value<u64>,
-    pub sender_oracle_sig:  Value<[u8; 64]>,
-    pub receiver_oracle_sig: Value<[u8; 64]>,
-    pub merkle_path:        Value<Vec<[u8; 32]>>,
+    pub sender_oracle_sig:       Value<[u8; 64]>,
+    pub receiver_oracle_sig:     Value<[u8; 64]>,
+    pub sender_merkle_siblings:  Value<Vec<[u8; 32]>>,
+    pub sender_merkle_directions: Value<Vec<bool>>,
+    pub receiver_merkle_siblings: Value<Vec<[u8; 32]>>,
+    pub receiver_merkle_directions: Value<Vec<bool>>,
 }
 ```
 
@@ -239,10 +279,16 @@ Sent once per transaction that needs compliance verification.
   "compliance_merkle_root":   "0xdeadbeef...",
   "oracle_pubkey_hash":       "0xoraclehash...",
   "block_height":             99999,
-  "merkle_path": [
+  "sender_merkle_siblings": [
     "0xaabbcc...",
     "0xddeeff..."
-  ]
+  ],
+  "sender_merkle_directions": [false, true],
+  "receiver_merkle_siblings": [
+    "0x112233...",
+    "0x445566..."
+  ],
+  "receiver_merkle_directions": [true, false]
 }
 ```
 
@@ -423,19 +469,20 @@ log assumption over the BN254 curve (`bn256::Fr` field, KZG commitment scheme). 
 
 - An adversary cannot produce a valid proof for a `(sender, receiver)` pair that
   is NOT in the compliance Merkle tree, except with negligible probability
-- The Poseidon hash binding (C3) prevents replay attacks where a valid proof is
+- The Poseidon hash binding (C5) prevents replay attacks where a valid proof is
   reused for a different transaction
 
 ### 5.2 Completeness
 
 The circuit is **complete**: any honest prover holding a valid witness
-(sender and receiver genuinely in the tree, correct merkle path, correct amount)
+(sender and receiver genuinely in the tree, correct Merkle paths, correct amount)
 can always generate an accepted proof.
 
 ### 5.3 Zero-Knowledge Property
 
-The proof reveals nothing about `sender_addr`, `receiver_addr`, `amount`, or
-`merkle_path` beyond what is already public (the Merkle root and tx hash). This
+The proof reveals nothing about `sender_pubkey`, `receiver_pubkey`, `amount`, or
+the sender/receiver Merkle siblings or direction bits beyond what is already
+public (the Merkle root and tx hash). This
 holds under the zero-knowledge property of PLONK:
 
 - The proof transcript is computationally indistinguishable from a simulated

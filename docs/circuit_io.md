@@ -1,6 +1,7 @@
 # Circuit I/O — ComplianceCircuit Input Table
 
-This document specifies the full public/private input split for `ComplianceCircuit`.
+This document specifies the current target public/private input split for
+`ComplianceCircuit`.
 
 ## Public Inputs
 
@@ -8,11 +9,12 @@ These are committed on-chain and visible to verifiers.
 
 | Field | Rust type | Halo2 cell type | Description |
 |---|---|---|---|
-| `tx_hash` | `[u8; 32]` | `[Column<Instance>; 32]` | Pedersen/Poseidon hash of (sender ‖ receiver ‖ amount) |
+| `tx_hash` | `[u8; 32]` | `[Column<Instance>; 32]` | Poseidon hash of (sender_pubkey ‖ receiver_pubkey ‖ amount) |
 | `compliance_merkle_root` | `[u8; 32]` | `[Column<Instance>; 32]` | Root of the compliance address set Merkle tree |
+| `oracle_pubkey_hash` | `[u8; 32]` | `[Column<Instance>; 32]` | Poseidon hash of the active compliance oracle public key |
 | `block_height` | `u64` | `Column<Instance>` | Block height of the compliance snapshot |
 
-Total public instance cells: 65
+Total public instance cells: 97
 
 ## Private Inputs (Witness)
 
@@ -20,57 +22,97 @@ These are loaded by the prover and never revealed to the verifier.
 
 | Field | Rust type | Halo2 region | Description |
 |---|---|---|---|
-| `sender_addr` | `[u8; 20]` | `advice` | Sender's address (20-byte Ethereum format) |
-| `receiver_addr` | `[u8; 20]` | `advice` | Receiver's address |
+| `sender_pubkey` | `[u8; 32]` | `advice` | Sender XRPL ed25519 public key |
+| `receiver_pubkey` | `[u8; 32]` | `advice` | Receiver XRPL ed25519 public key |
 | `amount` | `u64` | `advice` | Transaction amount |
-| `merkle_path` | `Vec<[u8; 32]>` | `advice` | Sibling hashes for Merkle membership proof |
+| `sender_oracle_sig` | `[u8; 64]` | `advice` | Oracle signature over `Poseidon(sender_pubkey)` |
+| `receiver_oracle_sig` | `[u8; 64]` | `advice` | Oracle signature over `Poseidon(receiver_pubkey)` |
+| `sender_merkle_siblings` | `Vec<[u8; 32]>` | `advice` | Sender Merkle sibling nodes |
+| `sender_merkle_directions` | `Vec<bool>` | `advice` | Sender left/right direction bits |
+| `receiver_merkle_siblings` | `Vec<[u8; 32]>` | `advice` | Receiver Merkle sibling nodes |
+| `receiver_merkle_directions` | `Vec<bool>` | `advice` | Receiver left/right direction bits |
 
 Merkle tree depth: configurable, default 20 (supports ~1M addresses).
-Path length: 20 × 32 bytes = 640 bytes of witness data.
+Each path carries 20 sibling nodes plus 20 direction bits.
+
+## Approved Direction
+
+The approved production direction for this repo is:
+
+- two independent pubkey membership proofs, one for sender and one for receiver
+- one shared public `compliance_merkle_root`
+- binary Poseidon parent hashing at every Merkle level
+- fixed-depth witnesses that include both siblings and direction bits
+
+The pre-ZK-13 Rust circuit may still temporarily expose a flattened
+concatenated-sibling `merkle_path` witness. Treat that as an implementation
+staging artifact, not the long-term circuit I/O model.
 
 ## Constraints
 
-### C1: Sender membership
+### C1: Sender oracle authorization
 ```
-MerkleVerify(
-    root = compliance_merkle_root,
-    leaf = Poseidon(sender_addr),
-    path = merkle_path[..depth/2]
+Ed25519Verify(
+    pk  = oracle_pubkey,
+    msg = Poseidon(sender_pubkey),
+    sig = sender_oracle_sig
 ) = 1
 ```
 
-### C2: Receiver membership
+### C2: Receiver oracle authorization
 ```
-MerkleVerify(
-    root = compliance_merkle_root,
-    leaf = Poseidon(receiver_addr),
-    path = merkle_path[depth/2..]
+Ed25519Verify(
+    pk  = oracle_pubkey,
+    msg = Poseidon(receiver_pubkey),
+    sig = receiver_oracle_sig
 ) = 1
 ```
 
-### C3: Transaction hash binding
+### C3: Sender membership
 ```
-Poseidon(sender_addr ‖ receiver_addr ‖ amount) = tx_hash
+MerkleVerify(
+    root = compliance_merkle_root,
+    leaf = Poseidon(sender_pubkey),
+    siblings = sender_merkle_siblings,
+    directions = sender_merkle_directions
+) = 1
 ```
 
-C3 prevents the prover from substituting compliant addresses for non-compliant ones
+### C4: Receiver membership
+```
+MerkleVerify(
+    root = compliance_merkle_root,
+    leaf = Poseidon(receiver_pubkey),
+    siblings = receiver_merkle_siblings,
+    directions = receiver_merkle_directions
+) = 1
+```
+
+### C5: Transaction hash binding
+```
+Poseidon(sender_pubkey ‖ receiver_pubkey ‖ amount) = tx_hash
+```
+
+C5 prevents the prover from substituting compliant pubkeys for non-compliant ones
 while reusing a valid tx_hash.
 
 ## Gate Design
 
 | Gate | Purpose | Degree |
 |---|---|---|
-| Poseidon hash gate | Hash sender, receiver, tx commitment | 3 |
-| Merkle path gate | Verify Merkle path at each level | 4 |
+| Poseidon hash gate | Hash sender/receiver leaves, Merkle parents, tx commitment | 3 |
+| Ed25519 verify gate | Verify oracle signatures for sender and receiver | 5 |
+| Merkle path gate | Verify binary Merkle path at each level | 4 |
 | Range check (lookup) | Constrain `amount` to u64 range | 2 |
 
-Target maximum gate degree: 4 (leaves headroom under PLONK degree bound of 8).
+Target maximum gate degree: 5 (within the PLONK degree bound of 8).
 
 ## Soundness Note
 
 The circuit is sound if the Merkle tree collision resistance holds under the
 Poseidon hash assumption. The zero-knowledge property holds because the witness
-(sender, receiver, amount, path) is never revealed — only the Halo2 proof
+(sender/receiver pubkeys, signatures, amount, siblings, direction bits) is
+never revealed — only the Halo2 proof
 transcript is transmitted.
 
 ## References
