@@ -759,8 +759,8 @@ mod tests {
     use super::inner::{normalize_request, ProofRequest};
     use compliance_circuit::{
         circuit::{
-            PublicInputs, Witness, BLOCK_HEIGHT_ROW, MERKLE_DEPTH, MERKLE_ROOT_START,
-            NUM_INSTANCE_ROWS, ORACLE_PUBKEY_HASH_START, TX_HASH_START,
+            tx_hash_field_from_inputs, PublicInputs, Witness, BLOCK_HEIGHT_ROW, MERKLE_DEPTH,
+            MERKLE_ROOT_START, NUM_INSTANCE_ROWS, ORACLE_PUBKEY_HASH_START, TX_HASH_START,
         },
         ComplianceCircuit,
     };
@@ -805,10 +805,11 @@ mod tests {
         let amount: u64 = 42;
         let block_height: u64 = 1;
 
-        // Derive field elements so the prototype gates (a+b=c) are satisfied.
+        // Derive field elements so the circuit's Poseidon tx-hash and additive
+        // Merkle prototype constraints are both satisfied.
         let sender_f = bytes_to_field_fr(&sender_pubkey);
         let receiver_f = bytes_to_field_fr(&receiver_pubkey);
-        let tx_hash_f = sender_f + receiver_f;
+        let tx_hash_f = tx_hash_field_from_inputs::<Fr>(&sender_pubkey, &receiver_pubkey, amount);
         let tx_hash: [u8; 32] = tx_hash_f.to_repr().into();
 
         let common_sib: [u8; 32] = {

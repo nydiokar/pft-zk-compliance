@@ -26,31 +26,25 @@
 //!
 //! # Gate design (see also `docs/circuit_io.md`)
 //!
-//! | Gate          | Constraint                    | Degree |
-//! |---------------|-------------------------------|--------|
-//! | `hash_binding`  | `a + b = c`                 | 2      |
-//! | `merkle_path`   | `node + sibling = parent`   | 2      |
-//! | `range_check`   | tautological placeholder    | 1      |
+//! | Gate              | Constraint                          | Degree |
+//! |-------------------|-------------------------------------|--------|
+//! | `tx_hash_poseidon`| Poseidon round transition           | 5      |
+//! | `merkle_path`     | `node + sibling = parent`           | 2      |
+//! | `range_check`     | tautological placeholder            | 1      |
 //!
 //! # Prototype substitutions
 //!
-//! Two primitives from the spec (`docs/circuit_io.md`) are **intentionally
+//! One primitive from the spec (`docs/circuit_io.md`) is still **intentionally
 //! simplified** for this prototype.  Each substitution is marked in the code
 //! with a `PROTOTYPE:` comment and a `PRODUCTION:` comment explaining the
 //! upgrade path.
 //!
-//! 1. **Hash function** — spec calls for Poseidon(sender ‖ receiver ‖ amount).
-//!    We use a linear sum `sender_commit + receiver_commit = tx_hash_commit`
-//!    because `halo2_gadgets::poseidon` requires a large additional dependency
-//!    and a more complex chip architecture.  The *constraint topology* (one gate
-//!    that binds three cells) is identical; only the internal polynomial differs.
-//!
-//! 2. **Merkle node hashing** — spec calls for Poseidon(left, right) at each
+//! 1. **Merkle node hashing** — spec calls for Poseidon(left, right) at each
 //!    level.  We use `left + right = parent` for the same reason.  The path-
 //!    traversal structure, region layout, and root-equality constraint are all
 //!    production-ready.
 //!
-//! 3. **Range check** — spec calls for a lookup table against a u64 range.
+//! 2. **Range check** — spec calls for a lookup table against a u64 range.
 //!    We use a tautological gate (`s*(a-a)=0`) because the lookup-table gadget
 //!    requires a separate table column.  The selector wire-up is production-ready.
 //!
@@ -63,9 +57,17 @@
 
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
-    plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Fixed, Instance, Selector},
+    plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression, Fixed, Instance, Selector},
     poly::Rotation,
 };
+use halo2_poseidon::{
+    generate_constants,
+    ConstantLength,
+    Hash as PoseidonHash,
+    Mds,
+    Spec,
+};
+use group::ff::FromUniformBytes;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -89,6 +91,13 @@ pub const ORACLE_PUBKEY_HASH_START: usize = 64;
 pub const ORACLE_PUBKEY_HASH_END: usize = 96;
 pub const BLOCK_HEIGHT_ROW: usize = 96;
 
+const TX_POSEIDON_WIDTH: usize = 4;
+const TX_POSEIDON_RATE: usize = 3;
+const TX_POSEIDON_FULL_ROUNDS: usize = 8;
+const TX_POSEIDON_PARTIAL_ROUNDS: usize = 56;
+const TX_POSEIDON_TOTAL_ROUNDS: usize =
+    TX_POSEIDON_FULL_ROUNDS + TX_POSEIDON_PARTIAL_ROUNDS;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public / private input types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,8 +105,7 @@ pub const BLOCK_HEIGHT_ROW: usize = 96;
 /// Public inputs committed on-chain; visible to verifiers.
 #[derive(Clone, Debug)]
 pub struct PublicInputs {
-    /// PROTOTYPE: linear commitment of (sender_pubkey ‖ receiver_pubkey ‖ amount).
-    /// PRODUCTION: Poseidon(sender_pubkey ‖ receiver_pubkey ‖ amount).
+    /// Poseidon commitment of (sender_pubkey ‖ receiver_pubkey ‖ amount).
     pub tx_hash: [u8; 32],
     /// Root of the compliance pubkey Merkle tree at `block_height`.
     pub compliance_merkle_root: [u8; 32],
@@ -149,12 +157,18 @@ pub struct ComplianceConfig {
     pub b: Column<Advice>,
     /// Output: tx_hash commitment / Merkle parent node.
     pub c: Column<Advice>,
+    /// Fourth state word for the tx-hash Poseidon permutation.
+    pub d: Column<Advice>,
     /// Fixed constants column — required by `assign_advice_from_constant`.
     pub constant: Column<Fixed>,
+    /// Poseidon round constants, one fixed column per state word.
+    pub poseidon_rc: [Column<Fixed>; TX_POSEIDON_WIDTH],
     /// Single instance column, rows 0..96 (see module-level table).
     pub instance: Column<Instance>,
-    /// Selector: activates the hash-binding gate (C3).
-    pub s_hash: Selector,
+    /// Selector: activates Poseidon full-round transitions for C3.
+    pub s_poseidon_full: Selector,
+    /// Selector: activates Poseidon partial-round transitions for C3.
+    pub s_poseidon_partial: Selector,
     /// Selector: activates the Merkle-path gate (C1 / C2 per level).
     pub s_merkle: Selector,
     /// Selector: activates the range-check gate (amount ∈ u64).
@@ -162,11 +176,21 @@ pub struct ComplianceConfig {
 }
 
 impl ComplianceConfig {
-    fn configure<F: ff::PrimeField>(meta: &mut ConstraintSystem<F>) -> Self {
+    fn configure<F>(meta: &mut ConstraintSystem<F>) -> Self
+    where
+        F: ff::PrimeField + FromUniformBytes<64> + Ord,
+    {
         let a = meta.advice_column();
         let b = meta.advice_column();
         let c = meta.advice_column();
+        let d = meta.advice_column();
         let constant = meta.fixed_column();
+        let poseidon_rc = [
+            meta.fixed_column(),
+            meta.fixed_column(),
+            meta.fixed_column(),
+            meta.fixed_column(),
+        ];
         let instance = meta.instance_column();
 
         // Enable equality on all columns so copy-constraints (including
@@ -174,27 +198,63 @@ impl ComplianceConfig {
         meta.enable_equality(a);
         meta.enable_equality(b);
         meta.enable_equality(c);
+        meta.enable_equality(d);
         meta.enable_equality(instance);
         meta.enable_constant(constant);
 
-        let s_hash = meta.selector();
+        let s_poseidon_full = meta.selector();
+        let s_poseidon_partial = meta.selector();
         let s_merkle = meta.selector();
         let s_range = meta.selector();
 
-        // ── C3: Hash-binding gate ─────────────────────────────────────────
-        // Enforces: a + b = c
-        //
-        // PROTOTYPE: linear sum over field elements folded from byte arrays.
-        // PRODUCTION: replace with halo2_gadgets::poseidon::Hash chip that
-        //   applies the Poseidon-128 permutation.  The gate structure (one
-        //   selector, three advice cells, one constraint) stays the same.
-        meta.create_gate("hash_binding", |vc| {
-            let s = vc.query_selector(s_hash);
-            let a = vc.query_advice(a, Rotation::cur());
-            let b = vc.query_advice(b, Rotation::cur());
-            let c = vc.query_advice(c, Rotation::cur());
-            // s_hash * (a + b - c) = 0
-            vec![s * (a + b - c)]
+        let mds = tx_poseidon_mds::<F>();
+        let pow_5 = |value: Expression<F>| {
+            let value_sq = value.clone() * value.clone();
+            value_sq.clone() * value_sq * value
+        };
+
+        meta.create_gate("tx_hash_poseidon_full_round", |vc| {
+            let s = vc.query_selector(s_poseidon_full);
+            let cur = [a, b, c, d].map(|column| vc.query_advice(column, Rotation::cur()));
+            let next = [a, b, c, d].map(|column| vc.query_advice(column, Rotation::next()));
+            let rc = poseidon_rc.map(|column| vc.query_fixed(column, Rotation::cur()));
+
+            (0..TX_POSEIDON_WIDTH)
+                .map(|row| {
+                    let mixed = (0..TX_POSEIDON_WIDTH)
+                        .map(|col| {
+                            Expression::Constant(mds[row][col])
+                                * pow_5(cur[col].clone() + rc[col].clone())
+                        })
+                        .reduce(|acc, term| acc + term)
+                        .expect("poseidon state is non-empty");
+                    s.clone() * (next[row].clone() - mixed)
+                })
+                .collect::<Vec<_>>()
+        });
+
+        meta.create_gate("tx_hash_poseidon_partial_round", |vc| {
+            let s = vc.query_selector(s_poseidon_partial);
+            let cur = [a, b, c, d].map(|column| vc.query_advice(column, Rotation::cur()));
+            let next = [a, b, c, d].map(|column| vc.query_advice(column, Rotation::next()));
+            let rc = poseidon_rc.map(|column| vc.query_fixed(column, Rotation::cur()));
+
+            let transformed = [
+                pow_5(cur[0].clone() + rc[0].clone()),
+                cur[1].clone() + rc[1].clone(),
+                cur[2].clone() + rc[2].clone(),
+                cur[3].clone() + rc[3].clone(),
+            ];
+
+            (0..TX_POSEIDON_WIDTH)
+                .map(|row| {
+                    let mixed = (0..TX_POSEIDON_WIDTH)
+                        .map(|col| Expression::Constant(mds[row][col]) * transformed[col].clone())
+                        .reduce(|acc, term| acc + term)
+                        .expect("poseidon state is non-empty");
+                    s.clone() * (next[row].clone() - mixed)
+                })
+                .collect::<Vec<_>>()
         });
 
         // ── C1 / C2: Merkle-path gate ────────────────────────────────────
@@ -232,9 +292,12 @@ impl ComplianceConfig {
             a,
             b,
             c,
+            d,
             constant,
+            poseidon_rc,
             instance,
-            s_hash,
+            s_poseidon_full,
+            s_poseidon_partial,
             s_merkle,
             s_range,
         }
@@ -277,6 +340,102 @@ fn bytes_to_field<F: ff::PrimeField>(bytes: &[u8]) -> F {
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TxHashPoseidonSpec;
+
+impl<F> Spec<F, TX_POSEIDON_WIDTH, TX_POSEIDON_RATE> for TxHashPoseidonSpec
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
+    fn full_rounds() -> usize {
+        TX_POSEIDON_FULL_ROUNDS
+    }
+
+    fn partial_rounds() -> usize {
+        TX_POSEIDON_PARTIAL_ROUNDS
+    }
+
+    fn sbox(val: F) -> F {
+        val.pow_vartime([5])
+    }
+
+    fn secure_mds() -> usize {
+        0
+    }
+
+    fn constants() -> (Vec<[F; TX_POSEIDON_WIDTH]>, Mds<F, TX_POSEIDON_WIDTH>, Mds<F, TX_POSEIDON_WIDTH>) {
+        generate_constants::<_, Self, TX_POSEIDON_WIDTH, TX_POSEIDON_RATE>()
+    }
+}
+
+fn tx_poseidon_constants<F>() -> Vec<[F; TX_POSEIDON_WIDTH]>
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
+    TxHashPoseidonSpec::constants().0
+}
+
+fn tx_poseidon_mds<F>() -> Mds<F, TX_POSEIDON_WIDTH>
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
+    TxHashPoseidonSpec::constants().1
+}
+
+fn tx_poseidon_hash_words<F>(message: [F; TX_POSEIDON_RATE]) -> F
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
+    PoseidonHash::<F, TxHashPoseidonSpec, ConstantLength<TX_POSEIDON_RATE>, TX_POSEIDON_WIDTH, TX_POSEIDON_RATE>::init()
+        .hash(message)
+}
+
+pub fn tx_hash_field_from_inputs<F>(
+    sender_pubkey: &[u8; 32],
+    receiver_pubkey: &[u8; 32],
+    amount: u64,
+) -> F
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
+    tx_poseidon_hash_words([
+        bytes_to_field(sender_pubkey),
+        bytes_to_field(receiver_pubkey),
+        F::from(amount),
+    ])
+}
+
+fn pow5_field<F: ff::PrimeField>(value: F) -> F {
+    value.pow_vartime([5])
+}
+
+fn tx_poseidon_round<F>(
+    state: [F; TX_POSEIDON_WIDTH],
+    round_constants: [F; TX_POSEIDON_WIDTH],
+    mds: &Mds<F, TX_POSEIDON_WIDTH>,
+    is_full_round: bool,
+) -> [F; TX_POSEIDON_WIDTH]
+where
+    F: ff::PrimeField,
+{
+    let transformed = if is_full_round {
+        core::array::from_fn(|idx| pow5_field(state[idx] + round_constants[idx]))
+    } else {
+        [
+            pow5_field(state[0] + round_constants[0]),
+            state[1] + round_constants[1],
+            state[2] + round_constants[2],
+            state[3] + round_constants[3],
+        ]
+    };
+
+    core::array::from_fn(|row| {
+        (0..TX_POSEIDON_WIDTH)
+            .map(|col| mds[row][col] * transformed[col])
+            .fold(F::ZERO, |acc, term| acc + term)
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ComplianceCircuit
 // ─────────────────────────────────────────────────────────────────────────────
@@ -289,7 +448,10 @@ pub struct ComplianceCircuit {
     pub witness: Value<Witness>,
 }
 
-impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
+impl<F> Circuit<F> for ComplianceCircuit
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
     type Config = ComplianceConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -347,23 +509,84 @@ impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
             },
         )?;
 
-        // ── Region 3: Hash-binding (C3) ──────────────────────────────────
-        // Constraint: sender_commit + receiver_commit = tx_hash_commit
-        //
-        // The tx_hash_commit cell is later wired to the instance column so the
-        // verifier can confirm it matches the on-chain tx_hash.
-        let tx_hash_commit = Value::known(bytes_to_field::<F>(&self.public.tx_hash));
+        // ── Region 3: Hash-binding (C3) via Poseidon ─────────────────────
+        // The circuit hashes [sender, receiver, amount] into a single field
+        // element and wires the first state word of the final permutation row
+        // to the public tx_hash instance cell.
+        let tx_poseidon_constants = tx_poseidon_constants::<F>();
+        let tx_poseidon_mds = tx_poseidon_mds::<F>();
         let tx_hash_cell: AssignedCell<F, F> = layouter.assign_region(
-            || "hash_binding",
+            || "tx_hash_poseidon",
             |mut region: Region<'_, F>| {
-                config.s_hash.enable(&mut region, 0)?;
-                // Copy sender / receiver from load_witness — prevents the
-                // prover from using different pubkeys here than in the Merkle
-                // membership regions.
                 sender_cell.copy_advice(|| "sender_h", &mut region, config.a, 0)?;
                 receiver_cell.copy_advice(|| "receiver_h", &mut region, config.b, 0)?;
-                let out = region.assign_advice(|| "tx_hash_out", config.c, 0, || tx_hash_commit)?;
-                Ok(out)
+                amount_cell.copy_advice(|| "amount_h", &mut region, config.c, 0)?;
+                region.assign_advice_from_constant(
+                    || "poseidon_capacity",
+                    config.d,
+                    0,
+                    F::from_u128((TX_POSEIDON_RATE as u128) << 64),
+                )?;
+
+                let mut current_state = [
+                    self.witness
+                        .as_ref()
+                        .map(|w| bytes_to_field::<F>(&w.sender_pubkey)),
+                    self.witness
+                        .as_ref()
+                        .map(|w| bytes_to_field::<F>(&w.receiver_pubkey)),
+                    self.witness.as_ref().map(|w| F::from(w.amount)),
+                    Value::known(F::from_u128((TX_POSEIDON_RATE as u128) << 64)),
+                ];
+                let mut final_state = None;
+
+                for (round, round_constants) in tx_poseidon_constants.iter().enumerate() {
+                    let is_full_round = round < TX_POSEIDON_FULL_ROUNDS / 2
+                        || round >= TX_POSEIDON_FULL_ROUNDS / 2 + TX_POSEIDON_PARTIAL_ROUNDS;
+                    if is_full_round {
+                        config.s_poseidon_full.enable(&mut region, round)?;
+                    } else {
+                        config.s_poseidon_partial.enable(&mut region, round)?;
+                    }
+
+                    for (column, round_constant) in
+                        config.poseidon_rc.iter().zip(round_constants.iter())
+                    {
+                        region.assign_fixed(
+                            || "poseidon_round_constant",
+                            *column,
+                            round,
+                            || Value::known(*round_constant),
+                        )?;
+                    }
+
+                    let next_state = current_state[0]
+                        .zip(current_state[1])
+                        .zip(current_state[2])
+                        .zip(current_state[3])
+                        .map(|(((a, b), c), d)| {
+                            tx_poseidon_round([a, b, c, d], *round_constants, &tx_poseidon_mds, is_full_round)
+                        });
+
+                    let next_cells = [
+                        region.assign_advice(|| "poseidon_next_0", config.a, round + 1, || next_state.map(|state| state[0]))?,
+                        region.assign_advice(|| "poseidon_next_1", config.b, round + 1, || next_state.map(|state| state[1]))?,
+                        region.assign_advice(|| "poseidon_next_2", config.c, round + 1, || next_state.map(|state| state[2]))?,
+                        region.assign_advice(|| "poseidon_next_3", config.d, round + 1, || next_state.map(|state| state[3]))?,
+                    ];
+                    current_state = [
+                        next_state.map(|state| state[0]),
+                        next_state.map(|state| state[1]),
+                        next_state.map(|state| state[2]),
+                        next_state.map(|state| state[3]),
+                    ];
+
+                    if round == TX_POSEIDON_TOTAL_ROUNDS - 1 {
+                        final_state = Some(next_cells[0].clone());
+                    }
+                }
+
+                final_state.ok_or(ErrorFront::Synthesis)
             },
         )?;
 
@@ -556,8 +779,8 @@ mod tests {
     // 1. Choose sender_pubkey, receiver_pubkey as raw byte arrays.
     // 2. Compute their field elements via bytes_to_field — this is the ground
     //    truth the circuit will use internally.
-    // 3. Derive tx_hash bytes by encoding (sender_f + receiver_f) back into
-    //    a [u8; 32] so that bytes_to_field(tx_hash) == sender_f + receiver_f.
+    // 3. Derive tx_hash bytes from the same Poseidon( sender, receiver, amount )
+    //    helper used by the circuit's C3 path.
     // 4. For each Merkle path: choose MERKLE_DEPTH-1 arbitrary sibling byte
     //    arrays, compute the running field sum, then derive the final sibling
     //    as (target_root_f - running) encoded back into bytes.
@@ -582,9 +805,7 @@ mod tests {
         let sender_f: Fr = bytes_to_field(&sender_pubkey);
         let receiver_f: Fr = bytes_to_field(&receiver_pubkey);
 
-        // tx_hash bytes encode (sender_f + receiver_f) so that
-        // bytes_to_field(tx_hash) == sender_f + receiver_f exactly.
-        let tx_hash_f: Fr = sender_f + receiver_f;
+        let tx_hash_f: Fr = tx_hash_field_from_inputs(&sender_pubkey, &receiver_pubkey, amount);
         let tx_hash: [u8; 32] = field_to_bytes(tx_hash_f);
 
         // Arbitrary but fixed sibling bytes for levels 0..MERKLE_DEPTH-2.
@@ -687,6 +908,20 @@ mod tests {
         assert!(
             prover.verify().is_err(),
             "Wrong tx_hash should cause verify() to fail"
+        );
+    }
+
+    #[test]
+    fn test_tampered_amount_breaks_poseidon_binding() {
+        let (mut circuit, instance) = make_fixture();
+        circuit.witness = circuit.witness.map(|mut w| {
+            w.amount += 1;
+            w
+        });
+        let prover = MockProver::<Fr>::run(8, &circuit, instance).expect("MockProver::run failed");
+        assert!(
+            prover.verify().is_err(),
+            "Changing amount without updating tx_hash should fail Poseidon binding"
         );
     }
 
