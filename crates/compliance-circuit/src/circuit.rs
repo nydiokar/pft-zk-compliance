@@ -4,9 +4,10 @@
 //!
 //! Without revealing any witness data, the circuit proves:
 //!
-//!   C1. `sender_addr`   ∈ compliance_list  (Merkle membership)
-//!   C2. `receiver_addr` ∈ compliance_list  (Merkle membership)
-//!   C3. `commit(sender ‖ receiver ‖ amount) = tx_hash`  (hash binding)
+//!   C1. `sender_pubkey`   ∈ compliance_list  (Merkle membership)
+//!   C2. `receiver_pubkey` ∈ compliance_list  (Merkle membership)
+//!   C3. `commit(sender_pubkey ‖ receiver_pubkey ‖ amount) = tx_hash`
+//!       (hash binding)
 //!
 //! # Public / private split
 //!
@@ -14,10 +15,13 @@
 //! |-------------|------------------------|---------------------|
 //! | Instance    | `tx_hash`              | 0..32               |
 //! | Instance    | `compliance_merkle_root` | 32..64             |
-//! | Instance    | `block_height`         | 64                  |
-//! | Advice      | `sender_addr`          | witness             |
-//! | Advice      | `receiver_addr`        | witness             |
+//! | Instance    | `oracle_pubkey_hash`   | 64..96              |
+//! | Instance    | `block_height`         | 96                  |
+//! | Advice      | `sender_pubkey`        | witness             |
+//! | Advice      | `receiver_pubkey`      | witness             |
 //! | Advice      | `amount`               | witness             |
+//! | Advice      | `sender_oracle_sig`    | witness             |
+//! | Advice      | `receiver_oracle_sig`  | witness             |
 //! | Advice      | `merkle_path`          | witness             |
 //!
 //! # Gate design (see also `docs/circuit_io.md`)
@@ -73,15 +77,17 @@ use halo2_proofs::{
 /// Prototype value: 4    →  fast compile + short MockProver run.
 pub const MERKLE_DEPTH: usize = 4;
 
-/// Total public instance rows: tx_hash(32) + merkle_root(32) + block_height(1).
-pub const NUM_INSTANCE_ROWS: usize = 65;
+/// Total public instance rows: tx_hash(32) + merkle_root(32) + oracle_hash(32) + block_height(1).
+pub const NUM_INSTANCE_ROWS: usize = 97;
 
 /// Instance column row ranges.
 pub const TX_HASH_START: usize = 0;
 pub const TX_HASH_END: usize = 32;
 pub const MERKLE_ROOT_START: usize = 32;
 pub const MERKLE_ROOT_END: usize = 64;
-pub const BLOCK_HEIGHT_ROW: usize = 64;
+pub const ORACLE_PUBKEY_HASH_START: usize = 64;
+pub const ORACLE_PUBKEY_HASH_END: usize = 96;
+pub const BLOCK_HEIGHT_ROW: usize = 96;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public / private input types
@@ -90,11 +96,16 @@ pub const BLOCK_HEIGHT_ROW: usize = 64;
 /// Public inputs committed on-chain; visible to verifiers.
 #[derive(Clone, Debug)]
 pub struct PublicInputs {
-    /// PROTOTYPE: linear commitment of (sender_addr ‖ receiver_addr ‖ amount).
-    /// PRODUCTION: Poseidon(sender_addr ‖ receiver_addr ‖ amount).
+    /// PROTOTYPE: linear commitment of (sender_pubkey ‖ receiver_pubkey ‖ amount).
+    /// PRODUCTION: Poseidon(sender_pubkey ‖ receiver_pubkey ‖ amount).
     pub tx_hash: [u8; 32],
-    /// Root of the compliance address Merkle tree at `block_height`.
+    /// Root of the compliance pubkey Merkle tree at `block_height`.
     pub compliance_merkle_root: [u8; 32],
+    /// Poseidon hash of the active compliance oracle public key.
+    ///
+    /// PROTOTYPE: carried through the public-input interface and verifier
+    /// plumbing, but not yet used by an in-circuit Ed25519 gadget.
+    pub oracle_pubkey_hash: [u8; 32],
     /// Block height of the compliance snapshot.
     pub block_height: u64,
 }
@@ -102,12 +113,22 @@ pub struct PublicInputs {
 /// Private witness — loaded by the prover, never revealed to the verifier.
 #[derive(Clone, Debug)]
 pub struct Witness {
-    /// Sender Ethereum-style address (20 bytes).
-    pub sender_addr: [u8; 20],
-    /// Receiver address (20 bytes).
-    pub receiver_addr: [u8; 20],
+    /// Sender XRPL ed25519 public key (32 bytes).
+    pub sender_pubkey: [u8; 32],
+    /// Receiver XRPL ed25519 public key (32 bytes).
+    pub receiver_pubkey: [u8; 32],
     /// Transaction amount.
     pub amount: u64,
+    /// Compliance oracle signature over `Poseidon(sender_pubkey)`.
+    ///
+    /// PROTOTYPE: stored in the witness boundary but not yet constrained until
+    /// the Ed25519 verification gadget lands.
+    pub sender_oracle_sig: [u8; 64],
+    /// Compliance oracle signature over `Poseidon(receiver_pubkey)`.
+    ///
+    /// PROTOTYPE: stored in the witness boundary but not yet constrained until
+    /// the Ed25519 verification gadget lands.
+    pub receiver_oracle_sig: [u8; 64],
     /// Sibling hashes for both Merkle membership proofs, concatenated.
     /// Layout: `[sender_sibling_0, .., sender_sibling_{D-1},
     ///           receiver_sibling_0, .., receiver_sibling_{D-1}]`
@@ -130,7 +151,7 @@ pub struct ComplianceConfig {
     pub c: Column<Advice>,
     /// Fixed constants column — required by `assign_advice_from_constant`.
     pub constant: Column<Fixed>,
-    /// Single instance column, rows 0..65 (see module-level table).
+    /// Single instance column, rows 0..96 (see module-level table).
     pub instance: Column<Instance>,
     /// Selector: activates the hash-binding gate (C3).
     pub s_hash: Selector,
@@ -207,7 +228,16 @@ impl ComplianceConfig {
             vec![s * (a.clone() - a)]
         });
 
-        ComplianceConfig { a, b, c, constant, instance, s_hash, s_merkle, s_range }
+        ComplianceConfig {
+            a,
+            b,
+            c,
+            constant,
+            instance,
+            s_hash,
+            s_merkle,
+            s_range,
+        }
     }
 }
 
@@ -252,7 +282,7 @@ fn bytes_to_field<F: ff::PrimeField>(bytes: &[u8]) -> F {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Halo2 ZKP circuit that proves transaction compliance without revealing
-/// sender address, receiver address, amount, or Merkle path.
+/// sender pubkey, receiver pubkey, amount, or Merkle path.
 #[derive(Clone, Debug)]
 pub struct ComplianceCircuit {
     pub public: PublicInputs,
@@ -264,7 +294,10 @@ impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
     type FloorPlanner = SimpleFloorPlanner;
 
     fn without_witnesses(&self) -> Self {
-        Self { public: self.public.clone(), witness: Value::unknown() }
+        Self {
+            public: self.public.clone(),
+            witness: Value::unknown(),
+        }
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
@@ -283,10 +316,14 @@ impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
         let (sender_cell, receiver_cell, amount_cell) = layouter.assign_region(
             || "load_witness",
             |mut region: Region<'_, F>| {
-                let sender_val =
-                    self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.sender_addr));
-                let receiver_val =
-                    self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.receiver_addr));
+                let sender_val = self
+                    .witness
+                    .as_ref()
+                    .map(|w| bytes_to_field::<F>(&w.sender_pubkey));
+                let receiver_val = self
+                    .witness
+                    .as_ref()
+                    .map(|w| bytes_to_field::<F>(&w.receiver_pubkey));
                 let amount_val = self.witness.as_ref().map(|w| F::from(w.amount));
 
                 let s = region.assign_advice(|| "sender", config.a, 0, || sender_val)?;
@@ -321,12 +358,11 @@ impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
             |mut region: Region<'_, F>| {
                 config.s_hash.enable(&mut region, 0)?;
                 // Copy sender / receiver from load_witness — prevents the
-                // prover from using different addresses here than in the Merkle
+                // prover from using different pubkeys here than in the Merkle
                 // membership regions.
                 sender_cell.copy_advice(|| "sender_h", &mut region, config.a, 0)?;
                 receiver_cell.copy_advice(|| "receiver_h", &mut region, config.b, 0)?;
-                let out =
-                    region.assign_advice(|| "tx_hash_out", config.c, 0, || tx_hash_commit)?;
+                let out = region.assign_advice(|| "tx_hash_out", config.c, 0, || tx_hash_commit)?;
                 Ok(out)
             },
         )?;
@@ -348,8 +384,10 @@ impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
         let root_val = bytes_to_field::<F>(&self.public.compliance_merkle_root);
 
         // ── Region 4: Merkle path for sender (C1) ────────────────────────
-        let sender_leaf =
-            self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.sender_addr));
+        let sender_leaf = self
+            .witness
+            .as_ref()
+            .map(|w| bytes_to_field::<F>(&w.sender_pubkey));
         let sender_path: Value<Vec<F>> = self.witness.as_ref().map(|w| {
             w.merkle_path[..MERKLE_DEPTH]
                 .iter()
@@ -366,15 +404,13 @@ impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
         )?;
 
         // Wire sender Merkle root → instance column (row MERKLE_ROOT_START).
-        layouter.constrain_instance(
-            sender_root_cell.cell(),
-            config.instance,
-            MERKLE_ROOT_START,
-        )?;
+        layouter.constrain_instance(sender_root_cell.cell(), config.instance, MERKLE_ROOT_START)?;
 
         // ── Region 5: Merkle path for receiver (C2) ──────────────────────
-        let receiver_leaf =
-            self.witness.as_ref().map(|w| bytes_to_field::<F>(&w.receiver_addr));
+        let receiver_leaf = self
+            .witness
+            .as_ref()
+            .map(|w| bytes_to_field::<F>(&w.receiver_pubkey));
         let receiver_path: Value<Vec<F>> = self.witness.as_ref().map(|w| {
             w.merkle_path[MERKLE_DEPTH..]
                 .iter()
@@ -398,7 +434,22 @@ impl<F: ff::PrimeField> Circuit<F> for ComplianceCircuit {
             MERKLE_ROOT_START,
         )?;
 
-        // ── Wire block_height → instance column (row 64) ─────────────────
+        // ── Wire oracle_pubkey_hash → instance column (row 64) ───────────
+        let oracle_hash_cell: AssignedCell<F, F> = layouter.assign_region(
+            || "oracle_pubkey_hash",
+            |mut region: Region<'_, F>| {
+                let oracle_hash_val =
+                    Value::known(bytes_to_field::<F>(&self.public.oracle_pubkey_hash));
+                region.assign_advice(|| "oracle_pubkey_hash", config.a, 0, || oracle_hash_val)
+            },
+        )?;
+        layouter.constrain_instance(
+            oracle_hash_cell.cell(),
+            config.instance,
+            ORACLE_PUBKEY_HASH_START,
+        )?;
+
+        // ── Wire block_height → instance column (row 96) ─────────────────
         // block_height is a scalar; assign it into a throwaway advice cell
         // just so we can record the copy-constraint.
         let bh_cell: AssignedCell<F, F> = layouter.assign_region(
@@ -461,8 +512,7 @@ fn assign_merkle_region<F: ff::PrimeField>(
 
                 region.assign_advice(|| "node", config.a, depth, || current)?;
                 region.assign_advice(|| "sibling", config.b, depth, || sibling)?;
-                let parent_cell =
-                    region.assign_advice(|| "parent", config.c, depth, || parent)?;
+                let parent_cell = region.assign_advice(|| "parent", config.c, depth, || parent)?;
 
                 if depth == MERKLE_DEPTH - 1 {
                     // Assign expected_root in advice (not fixed) so the value
@@ -503,7 +553,7 @@ mod tests {
     //
     // Construction strategy: work entirely in field arithmetic.
     //
-    // 1. Choose sender_addr, receiver_addr as raw byte arrays.
+    // 1. Choose sender_pubkey, receiver_pubkey as raw byte arrays.
     // 2. Compute their field elements via bytes_to_field — this is the ground
     //    truth the circuit will use internally.
     // 3. Derive tx_hash bytes by encoding (sender_f + receiver_f) back into
@@ -521,14 +571,16 @@ mod tests {
     }
 
     fn make_fixture() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
-        let sender_addr: [u8; 20] = [0x01u8; 20];
-        let receiver_addr: [u8; 20] = [0x02u8; 20];
+        let sender_pubkey: [u8; 32] = [0x01u8; 32];
+        let receiver_pubkey: [u8; 32] = [0x02u8; 32];
+        let sender_oracle_sig: [u8; 64] = [0x03u8; 64];
+        let receiver_oracle_sig: [u8; 64] = [0x04u8; 64];
         let amount: u64 = 999;
         let block_height: u64 = 1_000_000;
 
         // Ground-truth field elements for sender and receiver.
-        let sender_f: Fr = bytes_to_field(&sender_addr);
-        let receiver_f: Fr = bytes_to_field(&receiver_addr);
+        let sender_f: Fr = bytes_to_field(&sender_pubkey);
+        let receiver_f: Fr = bytes_to_field(&receiver_pubkey);
 
         // tx_hash bytes encode (sender_f + receiver_f) so that
         // bytes_to_field(tx_hash) == sender_f + receiver_f exactly.
@@ -554,8 +606,7 @@ mod tests {
         // The last sibling must satisfy: running + last_sib_f = target_root_f
         //   → last_sib_f = target_root_f - running
         let make_path = |leaf_f: Fr| -> Vec<[u8; 32]> {
-            let running: Fr = leaf_f
-                + common_f * Fr::from(MERKLE_DEPTH as u64 - 1);
+            let running: Fr = leaf_f + common_f * Fr::from(MERKLE_DEPTH as u64 - 1);
             let last_sib_f: Fr = target_root_f - running;
 
             let mut path = vec![common_sibling; MERKLE_DEPTH - 1];
@@ -568,29 +619,44 @@ mod tests {
 
         // Verify both paths in field arithmetic — no byte-sum guesswork.
         let check_path = |leaf_f: Fr, path: &[[u8; 32]]| -> Fr {
-            path.iter().fold(leaf_f, |cur, sib| cur + bytes_to_field::<Fr>(sib))
+            path.iter()
+                .fold(leaf_f, |cur, sib| cur + bytes_to_field::<Fr>(sib))
         };
         assert_eq!(check_path(sender_f, &sender_path), target_root_f);
         assert_eq!(check_path(receiver_f, &receiver_path), target_root_f);
 
         let compliance_merkle_root: [u8; 32] = field_to_bytes(target_root_f);
+        let oracle_pubkey_hash: [u8; 32] = field_to_bytes(Fr::from(0xA11CE_u64));
 
         let mut merkle_path = sender_path;
         merkle_path.extend_from_slice(&receiver_path);
 
-        let public = PublicInputs { tx_hash, compliance_merkle_root, block_height };
-        let witness = Witness { sender_addr, receiver_addr, amount, merkle_path };
+        let public = PublicInputs {
+            tx_hash,
+            compliance_merkle_root,
+            oracle_pubkey_hash,
+            block_height,
+        };
+        let witness = Witness {
+            sender_pubkey,
+            receiver_pubkey,
+            amount,
+            sender_oracle_sig,
+            receiver_oracle_sig,
+            merkle_path,
+        };
         let circuit = ComplianceCircuit {
             public: public.clone(),
             witness: Value::known(witness),
         };
 
-        // Instance column (65 rows).
-        // Only the three wired rows carry meaningful values; the rest are zero
+        // Instance column (97 rows).
+        // Only the four wired rows carry meaningful values; the rest are zero
         // because no constrain_instance call touches them.
         let mut instance_col = vec![Fr::ZERO; NUM_INSTANCE_ROWS];
         instance_col[TX_HASH_START] = tx_hash_f;
         instance_col[MERKLE_ROOT_START] = target_root_f;
+        instance_col[ORACLE_PUBKEY_HASH_START] = bytes_to_field(&public.oracle_pubkey_hash);
         instance_col[BLOCK_HEIGHT_ROW] = Fr::from(block_height);
 
         (circuit, vec![instance_col])
@@ -601,9 +667,10 @@ mod tests {
     fn test_valid_witness_passes() {
         let (circuit, instance) = make_fixture();
         // k = 8 → 2^8 = 256 rows; sufficient for MERKLE_DEPTH = 4.
-        let prover = MockProver::<Fr>::run(8, &circuit, instance)
-            .expect("MockProver::run failed");
-        prover.verify().expect("Valid witness should satisfy all constraints");
+        let prover = MockProver::<Fr>::run(8, &circuit, instance).expect("MockProver::run failed");
+        prover
+            .verify()
+            .expect("Valid witness should satisfy all constraints");
     }
 
     // ── Test 2: wrong tx_hash in public inputs → verify() fails ──────────
@@ -616,8 +683,7 @@ mod tests {
         let (circuit, mut instance) = make_fixture();
         // Corrupt the tx_hash instance value.
         instance[0][TX_HASH_START] += Fr::from(1u64);
-        let prover = MockProver::<Fr>::run(8, &circuit, instance)
-            .expect("MockProver::run failed");
+        let prover = MockProver::<Fr>::run(8, &circuit, instance).expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),
             "Wrong tx_hash should cause verify() to fail"
@@ -633,8 +699,7 @@ mod tests {
     fn test_wrong_merkle_root_fails() {
         let (circuit, mut instance) = make_fixture();
         instance[0][MERKLE_ROOT_START] += Fr::from(1u64);
-        let prover = MockProver::<Fr>::run(8, &circuit, instance)
-            .expect("MockProver::run failed");
+        let prover = MockProver::<Fr>::run(8, &circuit, instance).expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),
             "Wrong merkle_root should cause verify() to fail"
@@ -654,8 +719,7 @@ mod tests {
             w.merkle_path[0][0] ^= 0xFF;
             w
         });
-        let prover = MockProver::<Fr>::run(8, &circuit, instance)
-            .expect("MockProver::run failed");
+        let prover = MockProver::<Fr>::run(8, &circuit, instance).expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),
             "Wrong Merkle path should cause verify() to fail"

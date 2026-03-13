@@ -24,7 +24,7 @@
 //! |-------------------|----------------------------------------------------|
 //! | `"compliant"`     | All constraints satisfied; `proof_bytes` is set.  |
 //! | `"non_compliant"` | Circuit verification failed (bad witness/path).    |
-//! | `"error"`         | Malformed request, hex-decode failure, or panic.   |
+//! | `"error"`         | Malformed request, schema validation failure, or panic.   |
 //!
 //! # Platform
 //!
@@ -44,7 +44,10 @@ use std::path::PathBuf;
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "compliance-sidecar", about = "Post Fiat ZKP compliance sidecar")]
+#[command(
+    name = "compliance-sidecar",
+    about = "Post Fiat ZKP compliance sidecar"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -156,14 +159,19 @@ mod keygen {
         });
         // Write verifying key.
         write_file(&vk_path, "vk", |w| {
-            vk.write(w, SerdeFormat::RawBytes).map_err(|e| e.to_string())
+            vk.write(w, SerdeFormat::RawBytes)
+                .map_err(|e| e.to_string())
         });
         // Write proving key.
         write_file(&pk_path, "pk", |w| {
-            pk.write(w, SerdeFormat::RawBytes).map_err(|e| e.to_string())
+            pk.write(w, SerdeFormat::RawBytes)
+                .map_err(|e| e.to_string())
         });
 
-        eprintln!("[compliance-sidecar] wrote params → {}", params_path.display());
+        eprintln!(
+            "[compliance-sidecar] wrote params → {}",
+            params_path.display()
+        );
         eprintln!("[compliance-sidecar] wrote vk     → {}", vk_path.display());
         eprintln!("[compliance-sidecar] wrote pk     → {}", pk_path.display());
     }
@@ -177,6 +185,7 @@ mod keygen {
         PublicInputs {
             tx_hash: [0u8; 32],
             compliance_merkle_root: [0u8; 32],
+            oracle_pubkey_hash: [0u8; 32],
             block_height: 0,
         }
     }
@@ -187,12 +196,18 @@ mod keygen {
         F: FnOnce(&mut BufWriter<File>) -> Result<(), String>,
     {
         let file = File::create(path).unwrap_or_else(|e| {
-            eprintln!("error: could not create {label} file '{}': {e}", path.display());
+            eprintln!(
+                "error: could not create {label} file '{}': {e}",
+                path.display()
+            );
             std::process::exit(1);
         });
         let mut writer = BufWriter::new(file);
         f(&mut writer).unwrap_or_else(|e| {
-            eprintln!("error: could not write {label} to '{}': {e}", path.display());
+            eprintln!(
+                "error: could not write {label} to '{}': {e}",
+                path.display()
+            );
             std::process::exit(1);
         });
         writer.flush().unwrap_or_else(|e| {
@@ -200,7 +215,6 @@ mod keygen {
             std::process::exit(1);
         });
     }
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,8 +243,7 @@ mod inner {
             },
         },
         transcript::{
-            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer,
-            TranscriptWriterBuffer,
+            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
         },
         SerdeFormat,
     };
@@ -251,19 +264,26 @@ mod inner {
 
     /// JSON request sent by the postfiatd daemon to the sidecar.
     #[derive(Debug, Deserialize)]
-    pub struct ProofRequest {
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct ProofRequest {
         #[allow(dead_code)]
         pub version: u32,
         /// Hex-encoded Poseidon hash of the transaction (32 bytes).
         pub tx_hash: String,
-        /// Hex-encoded sender address (20 bytes).
-        pub sender_addr: String,
-        /// Hex-encoded receiver address (20 bytes).
-        pub receiver_addr: String,
+        /// Hex-encoded sender XRPL ed25519 pubkey (32 bytes).
+        pub sender_pubkey: String,
+        /// Hex-encoded receiver XRPL ed25519 pubkey (32 bytes).
+        pub receiver_pubkey: String,
         /// Transaction amount.
         pub amount: u64,
+        /// Hex-encoded oracle signature over `Poseidon(sender_pubkey)` (64 bytes).
+        pub sender_oracle_sig: String,
+        /// Hex-encoded oracle signature over `Poseidon(receiver_pubkey)` (64 bytes).
+        pub receiver_oracle_sig: String,
         /// Hex-encoded compliance Merkle tree root (32 bytes).
         pub compliance_merkle_root: String,
+        /// Hex-encoded Poseidon hash of the active oracle pubkey (32 bytes).
+        pub oracle_pubkey_hash: String,
         /// Block height of the compliance snapshot.
         pub block_height: u64,
         /// Hex-encoded sibling hashes for Merkle membership proof.
@@ -298,16 +318,36 @@ mod inner {
         pk: ProvingKey<G1Affine>,
     }
 
+    #[derive(Debug)]
+    pub(crate) struct NormalizedProofRequest {
+        pub(crate) tx_hash: [u8; 32],
+        pub(crate) sender_pubkey: [u8; 32],
+        pub(crate) receiver_pubkey: [u8; 32],
+        pub(crate) amount: u64,
+        pub(crate) sender_oracle_sig: [u8; 64],
+        pub(crate) receiver_oracle_sig: [u8; 64],
+        pub(crate) compliance_merkle_root: [u8; 32],
+        pub(crate) oracle_pubkey_hash: [u8; 32],
+        pub(crate) block_height: u64,
+        pub(crate) merkle_path: Vec<[u8; 32]>,
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Entry point
     // ─────────────────────────────────────────────────────────────────────────
 
     pub async fn run(socket_path: String, pk_path: PathBuf, params_path: PathBuf) {
         // ── Load KZG params ──────────────────────────────────────────────
-        eprintln!("[compliance-sidecar] loading params from {}", params_path.display());
+        eprintln!(
+            "[compliance-sidecar] loading params from {}",
+            params_path.display()
+        );
         let params = {
             let mut f = std::fs::File::open(&params_path).unwrap_or_else(|e| {
-                eprintln!("error: cannot open params file '{}': {e}", params_path.display());
+                eprintln!(
+                    "error: cannot open params file '{}': {e}",
+                    params_path.display()
+                );
                 std::process::exit(1);
             });
             ParamsKZG::<Bn256>::read(&mut f).unwrap_or_else(|e| {
@@ -319,12 +359,16 @@ mod inner {
         // ── Load proving key ─────────────────────────────────────────────
         // pk_read reconstructs the constraint system from the circuit topology
         // (same as keygen) and uses it to deserialize the raw proving key bytes.
-        eprintln!("[compliance-sidecar] loading proving key from {}", pk_path.display());
+        eprintln!(
+            "[compliance-sidecar] loading proving key from {}",
+            pk_path.display()
+        );
         let pk = {
             let dummy_circuit = ComplianceCircuit {
                 public: PublicInputs {
                     tx_hash: [0u8; 32],
                     compliance_merkle_root: [0u8; 32],
+                    oracle_pubkey_hash: [0u8; 32],
                     block_height: 0,
                 },
                 witness: Value::unknown(),
@@ -381,10 +425,7 @@ mod inner {
     /// Maximum bytes accepted per request line.
     const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 
-    async fn handle_connection(
-        stream: UnixStream,
-        state: Arc<ProverState>,
-    ) -> std::io::Result<()> {
+    async fn handle_connection(stream: UnixStream, state: Arc<ProverState>) -> std::io::Result<()> {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half.take(MAX_REQUEST_BYTES));
 
@@ -417,8 +458,8 @@ mod inner {
             }
         };
 
-        let mut response_bytes = serde_json::to_vec(&response)
-            .unwrap_or_else(|_| b"{\"status\":\"error\"}".to_vec());
+        let mut response_bytes =
+            serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"status\":\"error\"}".to_vec());
         response_bytes.push(b'\n');
         write_half.write_all(&response_bytes).await?;
 
@@ -492,45 +533,42 @@ mod inner {
     /// immediately call [`verify_proof_multi`] to self-verify before returning.
     fn run_circuit(req: ProofRequest, state: &ProverState) -> ProverResult {
         use compliance_circuit::circuit::{
-            BLOCK_HEIGHT_ROW, MERKLE_ROOT_START, NUM_INSTANCE_ROWS, TX_HASH_START,
+            BLOCK_HEIGHT_ROW, MERKLE_ROOT_START, NUM_INSTANCE_ROWS, ORACLE_PUBKEY_HASH_START,
+            TX_HASH_START,
         };
 
-        // ── Decode hex fields ────────────────────────────────────────────
-        let tx_hash = decode_hex_32(&req.tx_hash, "tx_hash").map_err(ProverError::Error)?;
-        let sender_addr = decode_hex_20(&req.sender_addr, "sender_addr").map_err(ProverError::Error)?;
-        let receiver_addr = decode_hex_20(&req.receiver_addr, "receiver_addr").map_err(ProverError::Error)?;
-        let compliance_merkle_root =
-            decode_hex_32(&req.compliance_merkle_root, "compliance_merkle_root").map_err(ProverError::Error)?;
-
-        let expected_path_len = 2 * MERKLE_DEPTH;
-        if req.merkle_path.len() != expected_path_len {
-            return Err(ProverError::Error(format!(
-                "merkle_path must have {expected_path_len} entries (got {})",
-                req.merkle_path.len()
-            )));
-        }
-        let merkle_path: Vec<[u8; 32]> = req
-            .merkle_path
-            .iter()
-            .enumerate()
-            .map(|(i, s)| decode_hex_32_unchecked(s, &format!("merkle_path[{i}]")))
-            .collect::<Result<_, _>>()
-            .map_err(ProverError::Error)?;
+        let req = normalize_request(req).map_err(ProverError::Error)?;
 
         // ── Build circuit inputs ─────────────────────────────────────────
-        let public =
-            PublicInputs { tx_hash, compliance_merkle_root, block_height: req.block_height };
-        let witness = Witness { sender_addr, receiver_addr, amount: req.amount, merkle_path };
-        let circuit = ComplianceCircuit { public: public.clone(), witness: Value::known(witness) };
+        let public = PublicInputs {
+            tx_hash: req.tx_hash,
+            compliance_merkle_root: req.compliance_merkle_root,
+            oracle_pubkey_hash: req.oracle_pubkey_hash,
+            block_height: req.block_height,
+        };
+        let witness = Witness {
+            sender_pubkey: req.sender_pubkey,
+            receiver_pubkey: req.receiver_pubkey,
+            amount: req.amount,
+            sender_oracle_sig: req.sender_oracle_sig,
+            receiver_oracle_sig: req.receiver_oracle_sig,
+            merkle_path: req.merkle_path,
+        };
+        let circuit = ComplianceCircuit {
+            public: public.clone(),
+            witness: Value::known(witness),
+        };
 
         // ── Build instance column ────────────────────────────────────────
         let tx_hash_f: Fr = bytes_to_field_fr(&public.tx_hash);
         let merkle_root_f: Fr = bytes_to_field_fr(&public.compliance_merkle_root);
+        let oracle_hash_f: Fr = bytes_to_field_fr(&public.oracle_pubkey_hash);
         let block_height_f: Fr = Fr::from(public.block_height);
 
         let mut instance_col = vec![Fr::ZERO; NUM_INSTANCE_ROWS];
         instance_col[TX_HASH_START] = tx_hash_f;
         instance_col[MERKLE_ROOT_START] = merkle_root_f;
+        instance_col[ORACLE_PUBKEY_HASH_START] = oracle_hash_f;
         instance_col[BLOCK_HEIGHT_ROW] = block_height_f;
 
         // ── Create real proof via SHPLONK + Blake2b transcript ───────────
@@ -578,7 +616,8 @@ mod inner {
             );
             if !ok {
                 return Err(ProverError::NonCompliant(
-                    "proof verification failed: self-check rejected the generated proof".to_string(),
+                    "proof verification failed: self-check rejected the generated proof"
+                        .to_string(),
                 ));
             }
         }
@@ -588,6 +627,7 @@ mod inner {
         let public_inputs_hex: Vec<String> = [
             (TX_HASH_START, tx_hash_f),
             (MERKLE_ROOT_START, merkle_root_f),
+            (ORACLE_PUBKEY_HASH_START, oracle_hash_f),
             (BLOCK_HEIGHT_ROW, block_height_f),
         ]
         .iter()
@@ -601,12 +641,51 @@ mod inner {
     // Hex decode helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    pub(crate) fn normalize_request(req: ProofRequest) -> Result<NormalizedProofRequest, String> {
+        let tx_hash = decode_hex_32(&req.tx_hash, "tx_hash")?;
+        let sender_pubkey = decode_hex_32(&req.sender_pubkey, "sender_pubkey")?;
+        let receiver_pubkey = decode_hex_32(&req.receiver_pubkey, "receiver_pubkey")?;
+        let sender_oracle_sig = decode_hex_64(&req.sender_oracle_sig, "sender_oracle_sig")?;
+        let receiver_oracle_sig = decode_hex_64(&req.receiver_oracle_sig, "receiver_oracle_sig")?;
+        let compliance_merkle_root =
+            decode_hex_32(&req.compliance_merkle_root, "compliance_merkle_root")?;
+        let oracle_pubkey_hash = decode_hex_32(&req.oracle_pubkey_hash, "oracle_pubkey_hash")?;
+
+        let expected_path_len = 2 * MERKLE_DEPTH;
+        if req.merkle_path.len() != expected_path_len {
+            return Err(format!(
+                "merkle_path must have {expected_path_len} entries (got {})",
+                req.merkle_path.len()
+            ));
+        }
+        let merkle_path = req
+            .merkle_path
+            .iter()
+            .enumerate()
+            .map(|(i, s)| decode_hex_32_unchecked(s, &format!("merkle_path[{i}]")))
+            .collect::<Result<_, _>>()?;
+
+        Ok(NormalizedProofRequest {
+            tx_hash,
+            sender_pubkey,
+            receiver_pubkey,
+            amount: req.amount,
+            sender_oracle_sig,
+            receiver_oracle_sig,
+            compliance_merkle_root,
+            oracle_pubkey_hash,
+            block_height: req.block_height,
+            merkle_path,
+        })
+    }
+
     fn decode_hex_32(s: &str, field: &str) -> Result<[u8; 32], String> {
         let bytes = hex::decode(s.trim_start_matches("0x"))
             .map_err(|e| format!("{field}: hex decode error: {e}"))?;
         let len = bytes.len();
-        let arr: [u8; 32] =
-            bytes.try_into().map_err(|_| format!("{field}: expected 32 bytes, got {len}"))?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| format!("{field}: expected 32 bytes, got {len}"))?;
 
         // Guard: reject values that may equal or exceed the BN254 Fr modulus.
         // Fr modulus in little-endian has byte[31] = 0x30.  Any input with
@@ -624,6 +703,15 @@ mod inner {
         Ok(arr)
     }
 
+    fn decode_hex_64(s: &str, field: &str) -> Result<[u8; 64], String> {
+        let bytes = hex::decode(s.trim_start_matches("0x"))
+            .map_err(|e| format!("{field}: hex decode error: {e}"))?;
+        let len = bytes.len();
+        bytes
+            .try_into()
+            .map_err(|_| format!("{field}: expected 64 bytes, got {len}"))
+    }
+
     /// Decode a hex string into 32 bytes without the modulus guard.
     ///
     /// Used for Merkle path siblings, which are advice (private) witness values.
@@ -633,14 +721,9 @@ mod inner {
         let bytes = hex::decode(s.trim_start_matches("0x"))
             .map_err(|e| format!("{field}: hex decode error: {e}"))?;
         let len = bytes.len();
-        bytes.try_into().map_err(|_| format!("{field}: expected 32 bytes, got {len}"))
-    }
-
-    fn decode_hex_20(s: &str, field: &str) -> Result<[u8; 20], String> {
-        let bytes = hex::decode(s.trim_start_matches("0x"))
-            .map_err(|e| format!("{field}: hex decode error: {e}"))?;
-        let len = bytes.len();
-        bytes.try_into().map_err(|_| format!("{field}: expected 20 bytes, got {len}"))
+        bytes
+            .try_into()
+            .map_err(|_| format!("{field}: expected 32 bytes, got {len}"))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -671,12 +754,13 @@ mod inner {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
+    use super::inner::{normalize_request, ProofRequest};
     use compliance_circuit::{
         circuit::{
             PublicInputs, Witness, BLOCK_HEIGHT_ROW, MERKLE_DEPTH, MERKLE_ROOT_START,
-            NUM_INSTANCE_ROWS, TX_HASH_START,
+            NUM_INSTANCE_ROWS, ORACLE_PUBKEY_HASH_START, TX_HASH_START,
         },
         ComplianceCircuit,
     };
@@ -684,12 +768,10 @@ mod tests {
         arithmetic::Field,
         circuit::Value,
         plonk::{create_proof, keygen_pk_custom, keygen_vk_custom, verify_proof_multi},
-        poly::{
-            kzg::{
-                commitment::{KZGCommitmentScheme, ParamsKZG},
-                multiopen::{ProverSHPLONK, VerifierSHPLONK},
-                strategy::SingleStrategy,
-            },
+        poly::kzg::{
+            commitment::{KZGCommitmentScheme, ParamsKZG},
+            multiopen::{ProverSHPLONK, VerifierSHPLONK},
+            strategy::SingleStrategy,
         },
         transcript::{
             Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
@@ -700,6 +782,7 @@ mod tests {
         ff::PrimeField,
     };
     use rand_core::OsRng;
+    use serde_json::json;
 
     fn bytes_to_field_fr(bytes: &[u8]) -> Fr {
         let mut repr = <Fr as PrimeField>::Repr::default();
@@ -715,18 +798,24 @@ mod tests {
 
     /// Build a minimal but valid circuit + instance column for k=8.
     fn make_circuit_and_instances() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
-        let sender_addr = [0x01u8; 20];
-        let receiver_addr = [0x02u8; 20];
+        let sender_pubkey = [0x01u8; 32];
+        let receiver_pubkey = [0x02u8; 32];
+        let sender_oracle_sig = [0x03u8; 64];
+        let receiver_oracle_sig = [0x04u8; 64];
         let amount: u64 = 42;
         let block_height: u64 = 1;
 
         // Derive field elements so the prototype gates (a+b=c) are satisfied.
-        let sender_f = bytes_to_field_fr(&sender_addr);
-        let receiver_f = bytes_to_field_fr(&receiver_addr);
+        let sender_f = bytes_to_field_fr(&sender_pubkey);
+        let receiver_f = bytes_to_field_fr(&receiver_pubkey);
         let tx_hash_f = sender_f + receiver_f;
         let tx_hash: [u8; 32] = tx_hash_f.to_repr().into();
 
-        let common_sib: [u8; 32] = { let mut a = [0u8; 32]; a[0] = 0x07; a };
+        let common_sib: [u8; 32] = {
+            let mut a = [0u8; 32];
+            a[0] = 0x07;
+            a
+        };
         let common_f = bytes_to_field_fr(&common_sib);
         let root_f = Fr::from(0xDEAD_BEEF_u64);
 
@@ -744,18 +833,36 @@ mod tests {
             .collect();
 
         let compliance_merkle_root: [u8; 32] = root_f.to_repr().into();
+        let oracle_pubkey_hash: [u8; 32] = Fr::from(0xA11CE_u64).to_repr().into();
 
-        let public = PublicInputs { tx_hash, compliance_merkle_root, block_height };
-        let witness = Witness { sender_addr, receiver_addr, amount, merkle_path };
-        let circuit = ComplianceCircuit { public: public.clone(), witness: Value::known(witness) };
+        let public = PublicInputs {
+            tx_hash,
+            compliance_merkle_root,
+            oracle_pubkey_hash,
+            block_height,
+        };
+        let witness = Witness {
+            sender_pubkey,
+            receiver_pubkey,
+            amount,
+            sender_oracle_sig,
+            receiver_oracle_sig,
+            merkle_path,
+        };
+        let circuit = ComplianceCircuit {
+            public: public.clone(),
+            witness: Value::known(witness),
+        };
 
         let tx_hash_field = bytes_to_field_fr(&public.tx_hash);
         let merkle_root_field = bytes_to_field_fr(&public.compliance_merkle_root);
+        let oracle_hash_field = bytes_to_field_fr(&public.oracle_pubkey_hash);
         let block_height_field = Fr::from(public.block_height);
 
         let mut instance_col = vec![Fr::ZERO; NUM_INSTANCE_ROWS];
         instance_col[TX_HASH_START] = tx_hash_field;
         instance_col[MERKLE_ROOT_START] = merkle_root_field;
+        instance_col[ORACLE_PUBKEY_HASH_START] = oracle_hash_field;
         instance_col[BLOCK_HEIGHT_ROW] = block_height_field;
 
         (circuit, vec![instance_col])
@@ -772,6 +879,7 @@ mod tests {
             public: PublicInputs {
                 tx_hash: [0u8; 32],
                 compliance_merkle_root: [0u8; 32],
+                oracle_pubkey_hash: [0u8; 32],
                 block_height: 0,
             },
             witness: Value::unknown(),
@@ -785,7 +893,12 @@ mod tests {
         // ── Prove ────────────────────────────────────────────────────────
         let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
         create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<Bn256>, _, _, _, _>(
-            &params, &pk, &[circuit], &instances, OsRng, &mut transcript,
+            &params,
+            &pk,
+            &[circuit],
+            &instances,
+            OsRng,
+            &mut transcript,
         )
         .expect("create_proof failed");
         let proof_bytes = transcript.finalize();
@@ -800,7 +913,12 @@ mod tests {
                 _,
                 _,
                 SingleStrategy<Bn256>,
-            >(&verifier_params, vk_for_verify, &[instance_col.clone()], &mut t)
+            >(
+                &verifier_params,
+                vk_for_verify,
+                &[instance_col.clone()],
+                &mut t,
+            )
         };
 
         // Valid proof must pass.
@@ -809,6 +927,106 @@ mod tests {
         // Corrupt one byte — must fail.
         let mut corrupted = proof_bytes.clone();
         corrupted[0] ^= 0xFF;
-        assert!(!verify(&corrupted), "corrupted proof passed verification (bug!)");
+        assert!(
+            !verify(&corrupted),
+            "corrupted proof passed verification (bug!)"
+        );
+    }
+
+    fn valid_request_json() -> serde_json::Value {
+        let merkle_entry = format!("0x{}", hex::encode([0x07u8; 32]));
+        let tx_hash = {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x11;
+            bytes
+        };
+        let sender_pubkey = {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x22;
+            bytes
+        };
+        let receiver_pubkey = {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x23;
+            bytes
+        };
+        let compliance_merkle_root = {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x12;
+            bytes
+        };
+        let oracle_pubkey_hash = {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x13;
+            bytes
+        };
+        json!({
+            "version": 1,
+            "tx_hash": format!("0x{}", hex::encode(tx_hash)),
+            "sender_pubkey": format!("0x{}", hex::encode(sender_pubkey)),
+            "receiver_pubkey": format!("0x{}", hex::encode(receiver_pubkey)),
+            "amount": 1000,
+            "sender_oracle_sig": format!("0x{}", hex::encode([0x44u8; 64])),
+            "receiver_oracle_sig": format!("0x{}", hex::encode([0x55u8; 64])),
+            "compliance_merkle_root": format!("0x{}", hex::encode(compliance_merkle_root)),
+            "oracle_pubkey_hash": format!("0x{}", hex::encode(oracle_pubkey_hash)),
+            "block_height": 42,
+            "merkle_path": vec![merkle_entry; 2 * MERKLE_DEPTH],
+        })
+    }
+
+    #[test]
+    fn test_v1_request_deserializes_and_normalizes() {
+        let raw = valid_request_json().to_string();
+        let req: ProofRequest = serde_json::from_str(&raw).expect("request should deserialize");
+        let normalized = normalize_request(req).expect("request should normalize");
+
+        let mut expected_sender = [0u8; 32];
+        expected_sender[0] = 0x22;
+        let mut expected_receiver = [0u8; 32];
+        expected_receiver[0] = 0x23;
+        assert_eq!(normalized.sender_pubkey, expected_sender);
+        assert_eq!(normalized.receiver_pubkey, expected_receiver);
+        assert_eq!(normalized.sender_oracle_sig, [0x44u8; 64]);
+        assert_eq!(normalized.receiver_oracle_sig, [0x55u8; 64]);
+    }
+
+    #[test]
+    fn test_invalid_pubkey_fails_cleanly() {
+        let mut raw = valid_request_json();
+        raw["sender_pubkey"] = json!(format!("0x{}", hex::encode([0x22u8; 31])));
+
+        let req: ProofRequest =
+            serde_json::from_str(&raw.to_string()).expect("schema should still deserialize");
+        let err = normalize_request(req).expect_err("bad pubkey should fail");
+        assert!(
+            err.contains("sender_pubkey: expected 32 bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_missing_or_invalid_oracle_field_fails_cleanly() {
+        let mut missing_sig = valid_request_json();
+        missing_sig
+            .as_object_mut()
+            .expect("object")
+            .remove("sender_oracle_sig");
+        let err = serde_json::from_str::<ProofRequest>(&missing_sig.to_string())
+            .expect_err("missing sender_oracle_sig should fail deserialization");
+        assert!(
+            err.to_string().contains("sender_oracle_sig"),
+            "unexpected serde error: {err}"
+        );
+
+        let mut bad_hash = valid_request_json();
+        bad_hash["oracle_pubkey_hash"] = json!(format!("0x{}", hex::encode([0x13u8; 31])));
+        let req: ProofRequest =
+            serde_json::from_str(&bad_hash.to_string()).expect("schema should still deserialize");
+        let err = normalize_request(req).expect_err("bad oracle field should fail");
+        assert!(
+            err.contains("oracle_pubkey_hash: expected 32 bytes"),
+            "unexpected error: {err}"
+        );
     }
 }
