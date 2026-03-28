@@ -31,7 +31,7 @@
 //! |-------------------|-------------------------------------|--------|
 //! | `tx_hash_poseidon`| Poseidon round transition           | 5      |
 //! | `merkle_path`     | direction bit + child ordering      | 2      |
-//! | `range_check`     | tautological placeholder            | 1      |
+//! | `range_check`     | 8-bit lookup decomposition of u64   | 1      |
 //!
 //! # Prototype substitutions
 //!
@@ -40,9 +40,9 @@
 //! with a `PROTOTYPE:` comment and a `PRODUCTION:` comment explaining the
 //! upgrade path.
 //!
-//! **Range check** — spec calls for a lookup table against a u64 range.
-//!    We use a tautological gate (`s*(a-a)=0`) because the lookup-table gadget
-//!    requires a separate table column.  The selector wire-up is production-ready.
+//! **Public-input byte wiring** — instance cells are still folded into one
+//!    field element per public input. Production should expose the full byte
+//!    layout described in `docs/circuit_io.md`.
 //!
 //! # Instance wiring
 //!
@@ -53,7 +53,10 @@
 
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
-    plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression, Fixed, Instance, Selector},
+    plonk::{
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression, Fixed, Instance,
+        Selector, TableColumn,
+    },
     poly::Rotation,
 };
 use halo2_poseidon::{
@@ -93,6 +96,9 @@ const TX_POSEIDON_FULL_ROUNDS: usize = 8;
 const TX_POSEIDON_PARTIAL_ROUNDS: usize = 56;
 const TX_POSEIDON_TOTAL_ROUNDS: usize =
     TX_POSEIDON_FULL_ROUNDS + TX_POSEIDON_PARTIAL_ROUNDS;
+const RANGE_LIMB_BITS: usize = 8;
+const RANGE_LIMB_BASE: u64 = 1 << RANGE_LIMB_BITS;
+const RANGE_LIMB_COUNT: usize = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public / private input types
@@ -174,6 +180,8 @@ pub struct ComplianceConfig {
     pub s_merkle: Selector,
     /// Selector: activates the range-check gate (amount ∈ u64).
     pub s_range: Selector,
+    /// Lookup table for a single 8-bit limb used by the u64 range check.
+    pub range_u8_table: TableColumn,
 }
 
 impl ComplianceConfig {
@@ -193,6 +201,7 @@ impl ComplianceConfig {
             meta.fixed_column(),
         ];
         let instance = meta.instance_column();
+        let range_u8_table = meta.lookup_table_column();
 
         // Enable equality on all columns so copy-constraints (including
         // constrain_instance wiring) can be recorded in the permutation argument.
@@ -206,7 +215,7 @@ impl ComplianceConfig {
         let s_poseidon_full = meta.selector();
         let s_poseidon_partial = meta.selector();
         let s_merkle = meta.selector();
-        let s_range = meta.selector();
+        let s_range = meta.complex_selector();
 
         let mds = poseidon_mds::<F>();
         let pow_5 = |value: Expression<F>| {
@@ -286,17 +295,64 @@ impl ComplianceConfig {
         });
 
         // ── Range gate ───────────────────────────────────────────────────
-        // Enforces that `amount` fits in u64.
-        //
-        // PROTOTYPE: tautological — the gate fires but never rejects because
-        //   `a - a = 0` always holds.  The selector wiring is correct.
-        // PRODUCTION: replace the gate body with a lookup argument against a
-        //   pre-computed u64 range table (halo2_gadgets RangeCheckChip).
+        // Enforces `amount = sum(limb_i * 2^(8*i))` across eight 8-bit limbs.
         meta.create_gate("range_check", |vc| {
             let s = vc.query_selector(s_range);
-            let a = vc.query_advice(a, Rotation::cur());
-            // s_range * (a - a) = 0  — always satisfied (placeholder)
-            vec![s * (a.clone() - a)]
+            let amount = vc.query_advice(a, Rotation::cur());
+            let limbs = [
+                vc.query_advice(b, Rotation::cur()),
+                vc.query_advice(c, Rotation::cur()),
+                vc.query_advice(d, Rotation::cur()),
+                vc.query_advice(a, Rotation::next()),
+                vc.query_advice(b, Rotation::next()),
+                vc.query_advice(c, Rotation::next()),
+                vc.query_advice(d, Rotation::next()),
+                vc.query_advice(a, Rotation(2)),
+            ];
+
+            let recomposed = limbs
+                .into_iter()
+                .enumerate()
+                .map(|(idx, limb)| {
+                    limb * Expression::Constant(F::from_u128(1u128 << (RANGE_LIMB_BITS * idx)))
+                })
+                .reduce(|acc, term| acc + term)
+                .expect("range limb list is non-empty");
+
+            vec![s * (amount - recomposed)]
+        });
+
+        meta.lookup("amount_u8_limb_lookup_0", |vc| {
+            let s = vc.query_selector(s_range);
+            vec![(s * vc.query_advice(b, Rotation::cur()), range_u8_table)]
+        });
+        meta.lookup("amount_u8_limb_lookup_1", |vc| {
+            let s = vc.query_selector(s_range);
+            vec![(s * vc.query_advice(c, Rotation::cur()), range_u8_table)]
+        });
+        meta.lookup("amount_u8_limb_lookup_2", |vc| {
+            let s = vc.query_selector(s_range);
+            vec![(s * vc.query_advice(d, Rotation::cur()), range_u8_table)]
+        });
+        meta.lookup("amount_u8_limb_lookup_3", |vc| {
+            let s = vc.query_selector(s_range);
+            vec![(s * vc.query_advice(a, Rotation::next()), range_u8_table)]
+        });
+        meta.lookup("amount_u8_limb_lookup_4", |vc| {
+            let s = vc.query_selector(s_range);
+            vec![(s * vc.query_advice(b, Rotation::next()), range_u8_table)]
+        });
+        meta.lookup("amount_u8_limb_lookup_5", |vc| {
+            let s = vc.query_selector(s_range);
+            vec![(s * vc.query_advice(c, Rotation::next()), range_u8_table)]
+        });
+        meta.lookup("amount_u8_limb_lookup_6", |vc| {
+            let s = vc.query_selector(s_range);
+            vec![(s * vc.query_advice(d, Rotation::next()), range_u8_table)]
+        });
+        meta.lookup("amount_u8_limb_lookup_7", |vc| {
+            let s = vc.query_selector(s_range);
+            vec![(s * vc.query_advice(a, Rotation(2)), range_u8_table)]
         });
 
         ComplianceConfig {
@@ -311,6 +367,7 @@ impl ComplianceConfig {
             s_poseidon_partial,
             s_merkle,
             s_range,
+            range_u8_table,
         }
     }
 }
@@ -420,6 +477,13 @@ where
     ])
 }
 
+pub fn merkle_leaf_hash_from_pubkey<F>(pubkey: &[u8; 32]) -> F
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
+    poseidon_hash_words([bytes_to_field(pubkey)])
+}
+
 pub fn merkle_parent_hash_fields<F>(left: F, right: F) -> F
 where
     F: ff::PrimeField + FromUniformBytes<64> + Ord,
@@ -518,6 +582,109 @@ where
     final_state.ok_or(ErrorFront::Synthesis)
 }
 
+fn assign_u8_range_table<F>(
+    config: &ComplianceConfig,
+    layouter: &mut impl Layouter<F>,
+) -> Result<(), ErrorFront>
+where
+    F: ff::PrimeField,
+{
+    layouter.assign_table(
+        || "u8_range_table",
+        |mut table| {
+            for value in 0..RANGE_LIMB_BASE {
+                table.assign_cell(
+                    || "u8_range_value",
+                    config.range_u8_table,
+                    value as usize,
+                    || Value::known(F::from(value)),
+                )?;
+            }
+
+            Ok(())
+        },
+    )
+}
+
+fn u64_to_u8_limbs(value: u64) -> [u8; RANGE_LIMB_COUNT] {
+    value.to_le_bytes()
+}
+
+fn assign_amount_range_region<F>(
+    config: &ComplianceConfig,
+    layouter: &mut impl Layouter<F>,
+    amount_cell: AssignedCell<F, F>,
+    limbs: Value<[u8; RANGE_LIMB_COUNT]>,
+) -> Result<(), ErrorFront>
+where
+    F: ff::PrimeField,
+{
+    layouter.assign_region(
+        || "range_check",
+        |mut region: Region<'_, F>| {
+            config.s_range.enable(&mut region, 0)?;
+            amount_cell.copy_advice(|| "amount_rc", &mut region, config.a, 0)?;
+
+            region.assign_advice(|| "limb_0", config.b, 0, || limbs.map(|v| F::from(v[0] as u64)))?;
+            region.assign_advice(|| "limb_1", config.c, 0, || limbs.map(|v| F::from(v[1] as u64)))?;
+            region.assign_advice(|| "limb_2", config.d, 0, || limbs.map(|v| F::from(v[2] as u64)))?;
+
+            region.assign_advice(|| "limb_3", config.a, 1, || limbs.map(|v| F::from(v[3] as u64)))?;
+            region.assign_advice(|| "limb_4", config.b, 1, || limbs.map(|v| F::from(v[4] as u64)))?;
+            region.assign_advice(|| "limb_5", config.c, 1, || limbs.map(|v| F::from(v[5] as u64)))?;
+            region.assign_advice(|| "limb_6", config.d, 1, || limbs.map(|v| F::from(v[6] as u64)))?;
+
+            region.assign_advice(|| "limb_7", config.a, 2, || limbs.map(|v| F::from(v[7] as u64)))?;
+            region.assign_advice_from_constant(|| "range_padding_b2", config.b, 2, F::ZERO)?;
+            region.assign_advice_from_constant(|| "range_padding_c2", config.c, 2, F::ZERO)?;
+            region.assign_advice_from_constant(|| "range_padding_d2", config.d, 2, F::ZERO)?;
+
+            Ok(())
+        },
+    )
+}
+
+fn assign_single_input_poseidon_region<F>(
+    config: &ComplianceConfig,
+    layouter: &mut impl Layouter<F>,
+    name: &'static str,
+    input: AssignedCell<F, F>,
+    poseidon_constants: &[[F; TX_POSEIDON_WIDTH]],
+    poseidon_mds: &Mds<F, TX_POSEIDON_WIDTH>,
+) -> Result<AssignedCell<F, F>, ErrorFront>
+where
+    F: ff::PrimeField + FromUniformBytes<64> + Ord,
+{
+    layouter.assign_region(
+        || name,
+        |mut region: Region<'_, F>| {
+            input.copy_advice(|| "poseidon_input_0", &mut region, config.a, 0)?;
+            region.assign_advice_from_constant(|| "poseidon_input_1", config.b, 0, F::ZERO)?;
+            region.assign_advice_from_constant(|| "poseidon_input_2", config.c, 0, F::ZERO)?;
+            region.assign_advice_from_constant(
+                || "poseidon_capacity",
+                config.d,
+                0,
+                poseidon_domain_tag::<F>(1),
+            )?;
+
+            assign_poseidon_permutation(
+                config,
+                &mut region,
+                0,
+                [
+                    input.value().copied(),
+                    Value::known(F::ZERO),
+                    Value::known(F::ZERO),
+                    Value::known(poseidon_domain_tag::<F>(1)),
+                ],
+                poseidon_constants,
+                poseidon_mds,
+            )
+        },
+    )
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ComplianceCircuit
 // ─────────────────────────────────────────────────────────────────────────────
@@ -553,6 +720,8 @@ where
         config: Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), ErrorFront> {
+        assign_u8_range_table(&config, &mut layouter)?;
+
         // ── Region 1: Load private witness ──────────────────────────────
         // Assign sender, receiver, amount as single field elements.
         // These cells are re-used (via copy-constraints) in every later region
@@ -578,18 +747,10 @@ where
         )?;
 
         // ── Region 2: Range check on amount ──────────────────────────────
-        // PROTOTYPE: gate is tautological; wiring is production-correct.
-        // PRODUCTION: the s_range selector activates a lookup table chip.
-        layouter.assign_region(
-            || "range_check",
-            |mut region: Region<'_, F>| {
-                config.s_range.enable(&mut region, 0)?;
-                // Copy from load_witness so the prover can't swap a different
-                // amount value into the range-check row.
-                amount_cell.copy_advice(|| "amount_rc", &mut region, config.a, 0)?;
-                Ok(())
-            },
-        )?;
+        // Copy from load_witness so the prover cannot swap a different amount
+        // into the range-check rows than the one used by Poseidon binding.
+        let amount_limbs = self.witness.as_ref().map(|w| u64_to_u8_limbs(w.amount));
+        assign_amount_range_region(&config, &mut layouter, amount_cell.clone(), amount_limbs)?;
 
         // ── Region 3: Hash-binding (C3) via Poseidon ─────────────────────
         // The circuit hashes [sender, receiver, amount] into a single field
@@ -644,10 +805,29 @@ where
             TX_HASH_START, // row 0: the folded tx_hash field element
         )?;
 
+        // ── Regions 4 / 5: Merkle leaf hashes ────────────────────────────
+        // Spec membership statements use Poseidon(pubkey) as the leaf value.
+        let sender_leaf_cell = assign_single_input_poseidon_region(
+            &config,
+            &mut layouter,
+            "sender_merkle_leaf",
+            sender_cell.clone(),
+            &poseidon_constants,
+            &poseidon_mds,
+        )?;
+        let receiver_leaf_cell = assign_single_input_poseidon_region(
+            &config,
+            &mut layouter,
+            "receiver_merkle_leaf",
+            receiver_cell.clone(),
+            &poseidon_constants,
+            &poseidon_mds,
+        )?;
+
         // ── Merkle root field element (same for both C1 and C2) ──────────
         let root_val = bytes_to_field::<F>(&self.public.compliance_merkle_root);
 
-        // ── Region 4: Merkle path for sender (C1) ────────────────────────
+        // ── Region 6: Merkle path for sender (C1) ────────────────────────
         let sender_path: Value<Vec<F>> = self.witness.as_ref().map(|w| {
             w.sender_merkle_siblings
                 .iter()
@@ -662,7 +842,7 @@ where
             &config,
             &mut layouter,
             "sender_merkle",
-            sender_cell.clone(),
+            sender_leaf_cell,
             sender_path,
             sender_directions,
             root_val,
@@ -673,7 +853,7 @@ where
         // Wire sender Merkle root → instance column (row MERKLE_ROOT_START).
         layouter.constrain_instance(sender_root_cell.cell(), config.instance, MERKLE_ROOT_START)?;
 
-        // ── Region 5: Merkle path for receiver (C2) ──────────────────────
+        // ── Region 7: Merkle path for receiver (C2) ──────────────────────
         let receiver_path: Value<Vec<F>> = self.witness.as_ref().map(|w| {
             w.receiver_merkle_siblings
                 .iter()
@@ -688,7 +868,7 @@ where
             &config,
             &mut layouter,
             "receiver_merkle",
-            receiver_cell.clone(),
+            receiver_leaf_cell,
             receiver_path,
             receiver_directions,
             root_val,
@@ -863,6 +1043,43 @@ mod tests {
     use halo2_proofs::{circuit::Value, dev::MockProver};
     use halo2curves::bn256::Fr;
 
+    #[derive(Clone, Debug)]
+    struct AmountRangeTestCircuit {
+        amount: Value<Fr>,
+        limbs: Value<[u8; RANGE_LIMB_COUNT]>,
+    }
+
+    impl Circuit<Fr> for AmountRangeTestCircuit {
+        type Config = ComplianceConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                amount: Value::unknown(),
+                limbs: Value::unknown(),
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+            ComplianceConfig::configure(meta)
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<Fr>,
+        ) -> Result<(), ErrorFront> {
+            assign_u8_range_table(&config, &mut layouter)?;
+
+            let amount_cell = layouter.assign_region(
+                || "load_amount",
+                |mut region| region.assign_advice(|| "amount", config.a, 0, || self.amount),
+            )?;
+
+            assign_amount_range_region(&config, &mut layouter, amount_cell, self.limbs)
+        }
+    }
+
     // ── Fixture builder ───────────────────────────────────────────────────
     //
     fn field_to_bytes(f: Fr) -> [u8; 32] {
@@ -922,8 +1139,8 @@ mod tests {
         let amount: u64 = 999;
         let block_height: u64 = 1_000_000;
 
-        let sender_f: Fr = bytes_to_field(&sender_pubkey);
-        let receiver_f: Fr = bytes_to_field(&receiver_pubkey);
+        let sender_f: Fr = merkle_leaf_hash_from_pubkey(&sender_pubkey);
+        let receiver_f: Fr = merkle_leaf_hash_from_pubkey(&receiver_pubkey);
         let tx_hash_f: Fr = tx_hash_field_from_inputs(&sender_pubkey, &receiver_pubkey, amount);
         let tx_hash: [u8; 32] = field_to_bytes(tx_hash_f);
 
@@ -990,6 +1207,34 @@ mod tests {
         instance_col[BLOCK_HEIGHT_ROW] = Fr::from(block_height);
 
         (circuit, vec![instance_col])
+    }
+
+    #[test]
+    fn test_range_check_valid_u64_amount_passes() {
+        let amount = 0x0123_4567_89AB_CDEFu64;
+        let circuit = AmountRangeTestCircuit {
+            amount: Value::known(Fr::from(amount)),
+            limbs: Value::known(u64_to_u8_limbs(amount)),
+        };
+        let prover =
+            MockProver::<Fr>::run(10, &circuit, vec![vec![]]).expect("MockProver::run failed");
+        prover
+            .verify()
+            .expect("Valid u64 limbs should satisfy the lookup-backed range check");
+    }
+
+    #[test]
+    fn test_range_check_rejects_negative_field_element() {
+        let circuit = AmountRangeTestCircuit {
+            amount: Value::known(-Fr::ONE),
+            limbs: Value::known([0xFF; RANGE_LIMB_COUNT]),
+        };
+        let prover =
+            MockProver::<Fr>::run(10, &circuit, vec![vec![]]).expect("MockProver::run failed");
+        assert!(
+            prover.verify().is_err(),
+            "Negative field element should fail the u64 range check"
+        );
     }
 
     // ── Test 1: valid witness → verify() passes ───────────────────────────

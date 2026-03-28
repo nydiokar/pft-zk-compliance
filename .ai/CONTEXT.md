@@ -1,8 +1,29 @@
 # pf-zk-compliance — Project Context
 
-**Branch:** `master`  **Last Updated:** 2026-03-13  **Status:** Real proof generation done — `create_proof` + Blake2b transcript, pk/params loaded at startup; ZK-12 Poseidon C3 tx-hash binding complete
+**Branch:** `master`  **Last Updated:** 2026-03-28  **Status:** Real proof generation done — `create_proof` + Blake2b transcript, pk/params loaded at startup; ZK-14 lookup-backed u64 range check complete
 
 ---
+
+next tasks: 
+
+The next work here is fairly clear from the current code and spec.
+
+  1. Implement the missing in-circuit oracle signature checks. The witness already carries sender_oracle_sig and
+     receiver_oracle_sig, but they are still unconstrained prototype fields in crates/compliance-circuit/src/
+     circuit.rs:117 and oracle_pubkey_hash is only passed through as a public input in crates/compliance-circuit/src/
+     circuit.rs:103. The spec expects Ed25519 verification for both parties in docs/SPEC.md:161.
+  2. Remove the remaining byte-packing prototype and switch fully to the production hashing model. bytes_to_field is
+     still a stopgap in crates/compliance-circuit/src/circuit.rs:322, and the tx hash/public input wiring is still
+     folded into one field element instead of true byte-level/public-input layout in crates/compliance-circuit/src/
+     circuit.rs:634. That is the main remaining gap between “working prototype” and the I/O described in docs/
+     circuit_io.md:8.
+  3. Move from prototype sizing to production sizing. The Merkle path logic is now on the right shape after ZK-13, but
+     MERKLE_DEPTH is still 4 with a comment saying production should be 20 in crates/compliance-circuit/src/
+     circuit.rs:72. That likely means benchmark work, larger-fixture tests, and regenerated proving/verifying keys.
+  4. Finish the validator-facing integration that is only specified, not present in this repo. The sidecar exists, but
+     the validator timeout, quarantine, proof propagation, and on-validator re-verification flows are still
+     architectural work described in docs/SPEC.md:313.
+
 
 ## Active Work
 
@@ -21,8 +42,8 @@
 | ✅ | **[ZK-10] Proof verification in sidecar** | M | `verify_proof_multi` (SHPLONK + Blake2b) called immediately after `create_proof`. VK loaded into `ProverState` at startup via `vk_read`. Verify failure → `"non_compliant"` status; internal errors → `"error"`. `serve` now takes `--vk` flag. `cargo check` passes. |
 | ✅ | **[ZK-11] Spec v1.1 pubkey-model alignment** | M | Rust circuit and sidecar IPC now use the spec-defined XRPL ed25519 pubkey model (`[u8; 32]`) plus oracle-signature/oracle-pubkey-hash fields. Validation rejects malformed pubkeys/oracle fields before proving. `cargo test -p compliance-circuit`, `cargo test -p compliance-sidecar`, and combined crate tests pass in a normal local environment. |
 | ✅ | **[ZK-12] Poseidon hash gates** | L | C3 transaction binding now uses Poseidon over `[sender_pubkey, receiver_pubkey, amount]` in the Rust circuit. Public-input wiring stays at the folded `TX_HASH_START` field element. Added focused tests for valid witnesses, tampered public `tx_hash`, and tampered witness `amount`. Full `cargo test` passes. |
-| [ ] | **[ZK-13] Binary Merkle chip** | L | Replace prototype additive sender/receiver Merkle paths with fixed-depth binary Poseidon paths to the shared compliance root. Add sibling + direction-bit witness handling and focused pass/fail tests. |
-| [ ] | **[ZK-14] Lookup table range check** | S | Replace tautological range gate with a proper lookup table constraining `amount` to u64. |
+| ✅ | **[ZK-13] Binary Merkle chip** | L | Sender/receiver membership now use fixed-depth binary Poseidon paths to the shared compliance root, with per-level sibling + direction-bit witnesses. Merkle leaves are `Poseidon(pubkey)` to match the spec. Focused pass/fail tests and the sidecar's real proof/verify test both pass. |
+| ✅ | **[ZK-14] Lookup table range check** | S | The tautological placeholder is gone. `amount` is now decomposed into eight 8-bit limbs, each constrained by a shared lookup table and recomposed back into the same witness value used by the Poseidon tx hash gate. Added pass/fail tests for valid u64 and non-u64 field values. |
 | [ ] | **[ZK-15] postfiatd IPC hook** | L | C++ side of the socket interface in postfiatd. Calls sidecar before forwarding tx to RPCA consensus. Depends on ZK-9/10/11 being stable. **When implementing: add `tokio::sync::Semaphore` in `ProverState` to cap concurrent `spawn_blocking` proof jobs — each proof is ~100-300 MB at k=8, unbounded concurrency under burst load causes OOM. Limit should be a `--max-concurrent-proofs` CLI flag sized against real circuit memory at production k.** Integration target remains the Post Fiat `postfiatd` validator daemon described in `docs/SPEC.md`. |
 | [ ] | **[ZK-16] Pin halo2 git dep** | S | Add `rev = "<commit>"` to halo2_proofs git dep in all Cargo.toml files. Supply-chain hygiene before any production deployment. |
 
@@ -75,7 +96,8 @@
 - **[ZK-11 done]** Rust IPC/circuit boundary now uses `sender_pubkey` / `receiver_pubkey` (`[u8; 32]`) plus `sender_oracle_sig` / `receiver_oracle_sig` (`[u8; 64]`) and public `oracle_pubkey_hash`. Validation rejects malformed pubkey/oracle-field payloads before proving begins.
 - **[open]** PSE halo2 git dep is unpinned (`git = "..."` without a rev). Must pin to a specific commit before any production deployment.
 - **[ZK-12 done]** C3 transaction binding no longer uses the prototype linear gate. It now enforces a Poseidon-based hash path in `crates/compliance-circuit/src/circuit.rs`. The sidecar's proof-building test fixture was updated to derive the same `tx_hash` field value via the shared helper.
-- **[open, by design]** Merkle membership still uses prototype additive hashing (`node + sibling = parent`) until ZK-13. The approved replacement is two fixed-depth binary Poseidon paths, one for sender and one for receiver, each carrying sibling nodes plus direction bits and converging to the same public `compliance_merkle_root`.
+- **[ZK-13 done]** Merkle membership now uses two fixed-depth binary Poseidon paths, one for sender and one for receiver, converging to the shared public `compliance_merkle_root`. Merkle leaves are `Poseidon(pubkey)`, matching `docs/SPEC.md` and `docs/circuit_io.md`.
+- **[ZK-14 done]** `amount` is now range-checked as a true u64 via an 8-bit lookup table plus linear recomposition. The same copied advice cell feeds both the range-check region and the C3 Poseidon binding, so the prover cannot swap in a different amount across regions.
 - **[open, by design]** Instance column wires one folded field element per public input. Production circuit would wire all 32 individual byte cells to match the full `[u8; 32]` layout in `docs/circuit_io.md`.
 - **[open]** `postfiatd` is C++ (rippled fork). No C++ changes are needed until ZK-15 (IPC hook).
 - **[platform]** Unix socket listener is Linux-only (`cfg(unix)`). Build/type-check on Windows with `cargo check --target x86_64-unknown-linux-gnu -p compliance-sidecar`.
