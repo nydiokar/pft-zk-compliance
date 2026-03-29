@@ -227,9 +227,10 @@ mod inner {
 
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use compliance_circuit::{
-        circuit::{PublicInputs, Witness, MERKLE_DEPTH},
+        circuit::{merkle_leaf_hash_from_pubkey, PublicInputs, Witness, MERKLE_DEPTH},
         ComplianceCircuit,
     };
+    use ed25519_dalek::{Signature, VerifyingKey};
     use halo2_proofs::{
         arithmetic::Field,
         circuit::Value,
@@ -280,6 +281,8 @@ mod inner {
         pub sender_oracle_sig: String,
         /// Hex-encoded oracle signature over `Poseidon(receiver_pubkey)` (64 bytes).
         pub receiver_oracle_sig: String,
+        /// Hex-encoded compliance oracle ed25519 public key (32 bytes).
+        pub oracle_pubkey: String,
         /// Hex-encoded compliance Merkle tree root (32 bytes).
         pub compliance_merkle_root: String,
         /// Hex-encoded Poseidon hash of the active oracle pubkey (32 bytes).
@@ -333,6 +336,7 @@ mod inner {
         pub(crate) amount: u64,
         pub(crate) sender_oracle_sig: [u8; 64],
         pub(crate) receiver_oracle_sig: [u8; 64],
+        pub(crate) oracle_pubkey: [u8; 32],
         pub(crate) compliance_merkle_root: [u8; 32],
         pub(crate) oracle_pubkey_hash: [u8; 32],
         pub(crate) block_height: u64,
@@ -548,6 +552,8 @@ mod inner {
         };
 
         let req = normalize_request(req).map_err(ProverError::Error)?;
+        validate_oracle_authorizations(&req)
+            .map_err(ProverError::NonCompliant)?;
 
         // ── Build circuit inputs ─────────────────────────────────────────
         let public = PublicInputs {
@@ -562,6 +568,7 @@ mod inner {
             amount: req.amount,
             sender_oracle_sig: req.sender_oracle_sig,
             receiver_oracle_sig: req.receiver_oracle_sig,
+            oracle_pubkey: req.oracle_pubkey,
             sender_merkle_siblings: req.sender_merkle_siblings,
             sender_merkle_directions: req.sender_merkle_directions,
             receiver_merkle_siblings: req.receiver_merkle_siblings,
@@ -650,6 +657,27 @@ mod inner {
         Ok((proof_b64, public_inputs_hex, proof_time_ms))
     }
 
+    pub(crate) fn validate_oracle_authorizations(
+        req: &NormalizedProofRequest,
+    ) -> Result<(), String> {
+        let verifying_key = VerifyingKey::from_bytes(&req.oracle_pubkey)
+            .map_err(|e| format!("invalid oracle_pubkey: {e}"))?;
+        let sender_sig = Signature::from_bytes(&req.sender_oracle_sig);
+        let receiver_sig = Signature::from_bytes(&req.receiver_oracle_sig);
+
+        let sender_msg = merkle_leaf_hash_from_pubkey::<Fr>(&req.sender_pubkey).to_repr();
+        let receiver_msg = merkle_leaf_hash_from_pubkey::<Fr>(&req.receiver_pubkey).to_repr();
+
+        verifying_key
+            .verify_strict(sender_msg.as_ref(), &sender_sig)
+            .map_err(|e| format!("sender_oracle_sig verification failed: {e}"))?;
+        verifying_key
+            .verify_strict(receiver_msg.as_ref(), &receiver_sig)
+            .map_err(|e| format!("receiver_oracle_sig verification failed: {e}"))?;
+
+        Ok(())
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Hex decode helpers
     // ─────────────────────────────────────────────────────────────────────────
@@ -660,6 +688,7 @@ mod inner {
         let receiver_pubkey = decode_hex_32(&req.receiver_pubkey, "receiver_pubkey")?;
         let sender_oracle_sig = decode_hex_64(&req.sender_oracle_sig, "sender_oracle_sig")?;
         let receiver_oracle_sig = decode_hex_64(&req.receiver_oracle_sig, "receiver_oracle_sig")?;
+        let oracle_pubkey = decode_hex_32(&req.oracle_pubkey, "oracle_pubkey")?;
         let compliance_merkle_root =
             decode_hex_32(&req.compliance_merkle_root, "compliance_merkle_root")?;
         let oracle_pubkey_hash = decode_hex_32(&req.oracle_pubkey_hash, "oracle_pubkey_hash")?;
@@ -709,6 +738,7 @@ mod inner {
             amount: req.amount,
             sender_oracle_sig,
             receiver_oracle_sig,
+            oracle_pubkey,
             compliance_merkle_root,
             oracle_pubkey_hash,
             block_height: req.block_height,
@@ -806,6 +836,7 @@ mod tests {
         },
         ComplianceCircuit,
     };
+    use ed25519_dalek::{Signer as _, SigningKey};
     use halo2_proofs::{
         arithmetic::Field,
         circuit::Value,
@@ -876,12 +907,28 @@ mod tests {
         (siblings, directions)
     }
 
+    fn sign_poseidon_pubkey_message(signing_key: &SigningKey, pubkey: [u8; 32]) -> [u8; 64] {
+        let msg = merkle_leaf_hash_from_pubkey::<Fr>(&pubkey).to_repr();
+        signing_key.sign(msg.as_ref()).to_bytes()
+    }
+
+    fn generate_fr_compatible_signing_key() -> SigningKey {
+        loop {
+            let candidate = SigningKey::generate(&mut OsRng);
+            if candidate.verifying_key().to_bytes()[31] < 0x30 {
+                return candidate;
+            }
+        }
+    }
+
     /// Build a minimal but valid circuit + instance column for k=10.
     fn make_circuit_and_instances() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
         let sender_pubkey = [0x01u8; 32];
         let receiver_pubkey = [0x02u8; 32];
-        let sender_oracle_sig = [0x03u8; 64];
-        let receiver_oracle_sig = [0x04u8; 64];
+        let signing_key = generate_fr_compatible_signing_key();
+        let oracle_pubkey = signing_key.verifying_key().to_bytes();
+        let sender_oracle_sig = sign_poseidon_pubkey_message(&signing_key, sender_pubkey);
+        let receiver_oracle_sig = sign_poseidon_pubkey_message(&signing_key, receiver_pubkey);
         let amount: u64 = 42;
         let block_height: u64 = 1;
 
@@ -905,7 +952,8 @@ mod tests {
             extract_merkle_path(&tree, receiver_index);
 
         let compliance_merkle_root: [u8; 32] = root_f.to_repr().into();
-        let oracle_pubkey_hash: [u8; 32] = Fr::from(0xA11CE_u64).to_repr().into();
+        let oracle_pubkey_hash: [u8; 32] =
+            merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey).to_repr().into();
 
         let public = PublicInputs {
             tx_hash,
@@ -916,6 +964,7 @@ mod tests {
         let witness = Witness {
             sender_pubkey,
             receiver_pubkey,
+            oracle_pubkey,
             amount,
             sender_oracle_sig,
             receiver_oracle_sig,
@@ -1029,11 +1078,14 @@ mod tests {
             bytes[0] = 0x12;
             bytes
         };
-        let oracle_pubkey_hash = {
-            let mut bytes = [0u8; 32];
-            bytes[0] = 0x13;
-            bytes
+        let signing_key = generate_fr_compatible_signing_key();
+        let oracle_pubkey = signing_key.verifying_key().to_bytes();
+        let oracle_pubkey_hash = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey).to_repr();
+        let oracle_pubkey = {
+            oracle_pubkey
         };
+        let sender_oracle_sig = sign_poseidon_pubkey_message(&signing_key, sender_pubkey);
+        let receiver_oracle_sig = sign_poseidon_pubkey_message(&signing_key, receiver_pubkey);
         let sender_sibling = format!("0x{}", hex::encode([0x07u8; 32]));
         let receiver_sibling = format!("0x{}", hex::encode([0x08u8; 32]));
         json!({
@@ -1042,8 +1094,9 @@ mod tests {
             "sender_pubkey": format!("0x{}", hex::encode(sender_pubkey)),
             "receiver_pubkey": format!("0x{}", hex::encode(receiver_pubkey)),
             "amount": 1000,
-            "sender_oracle_sig": format!("0x{}", hex::encode([0x44u8; 64])),
-            "receiver_oracle_sig": format!("0x{}", hex::encode([0x55u8; 64])),
+            "sender_oracle_sig": format!("0x{}", hex::encode(sender_oracle_sig)),
+            "receiver_oracle_sig": format!("0x{}", hex::encode(receiver_oracle_sig)),
+            "oracle_pubkey": format!("0x{}", hex::encode(oracle_pubkey)),
             "compliance_merkle_root": format!("0x{}", hex::encode(compliance_merkle_root)),
             "oracle_pubkey_hash": format!("0x{}", hex::encode(oracle_pubkey_hash)),
             "block_height": 42,
@@ -1066,11 +1119,50 @@ mod tests {
         expected_receiver[0] = 0x23;
         assert_eq!(normalized.sender_pubkey, expected_sender);
         assert_eq!(normalized.receiver_pubkey, expected_receiver);
-        assert_eq!(normalized.sender_oracle_sig, [0x44u8; 64]);
-        assert_eq!(normalized.receiver_oracle_sig, [0x55u8; 64]);
+        assert_ne!(normalized.sender_oracle_sig, [0u8; 64]);
+        assert_ne!(normalized.receiver_oracle_sig, [0u8; 64]);
+        let mut expected_oracle = [0u8; 32];
+        expected_oracle.copy_from_slice(&normalized.oracle_pubkey);
+        assert_eq!(normalized.oracle_pubkey, expected_oracle);
         assert_eq!(normalized.sender_merkle_siblings.len(), MERKLE_DEPTH);
         assert_eq!(normalized.sender_merkle_directions, vec![false, true, false, true]);
         assert_eq!(normalized.receiver_merkle_directions, vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn test_oracle_authorization_validates_real_signatures() {
+        let raw = valid_request_json().to_string();
+        let req: ProofRequest = serde_json::from_str(&raw).expect("request should deserialize");
+        let normalized = normalize_request(req).expect("request should normalize");
+        super::inner::validate_oracle_authorizations(&normalized)
+            .expect("valid oracle signatures should verify");
+    }
+
+    #[test]
+    fn test_oracle_authorization_rejects_tampered_signature() {
+        let mut raw = valid_request_json();
+        let bad_sig = {
+            let mut bytes = hex::decode(
+                raw["sender_oracle_sig"]
+                    .as_str()
+                    .expect("sender_oracle_sig string")
+                    .trim_start_matches("0x"),
+            )
+            .expect("valid hex");
+            bytes[0] ^= 0xFF;
+            format!("0x{}", hex::encode(bytes))
+        };
+        raw["sender_oracle_sig"] = json!(bad_sig);
+
+        let req: ProofRequest =
+            serde_json::from_str(&raw.to_string()).expect("request should deserialize");
+        let normalized = normalize_request(req).expect("request should normalize");
+        let err = super::inner::validate_oracle_authorizations(&normalized)
+            .expect_err("tampered signature should fail");
+        assert!(
+            err.contains("sender_oracle_sig verification failed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1098,6 +1190,18 @@ mod tests {
             .expect_err("missing sender_oracle_sig should fail deserialization");
         assert!(
             err.to_string().contains("sender_oracle_sig"),
+            "unexpected serde error: {err}"
+        );
+
+        let mut missing_oracle_pubkey = valid_request_json();
+        missing_oracle_pubkey
+            .as_object_mut()
+            .expect("object")
+            .remove("oracle_pubkey");
+        let err = serde_json::from_str::<ProofRequest>(&missing_oracle_pubkey.to_string())
+            .expect_err("missing oracle_pubkey should fail deserialization");
+        assert!(
+            err.to_string().contains("oracle_pubkey"),
             "unexpected serde error: {err}"
         );
 

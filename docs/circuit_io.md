@@ -24,9 +24,10 @@ These are loaded by the prover and never revealed to the verifier.
 |---|---|---|---|
 | `sender_pubkey` | `[u8; 32]` | `advice` | Sender XRPL ed25519 public key |
 | `receiver_pubkey` | `[u8; 32]` | `advice` | Receiver XRPL ed25519 public key |
+| `oracle_pubkey` | `[u8; 32]` | `advice` | Compliance oracle public key for the circuit-friendly authorization scheme |
 | `amount` | `u64` | `advice` | Transaction amount |
-| `sender_oracle_sig` | `[u8; 64]` | `advice` | Oracle signature over `Poseidon(sender_pubkey)` |
-| `receiver_oracle_sig` | `[u8; 64]` | `advice` | Oracle signature over `Poseidon(receiver_pubkey)` |
+| `sender_oracle_sig` | `[u8; 64]` | `advice` | Oracle authorization signature over `Poseidon(sender_pubkey)` |
+| `receiver_oracle_sig` | `[u8; 64]` | `advice` | Oracle authorization signature over `Poseidon(receiver_pubkey)` |
 | `sender_merkle_siblings` | `Vec<[u8; 32]>` | `advice` | Sender Merkle sibling nodes |
 | `sender_merkle_directions` | `Vec<bool>` | `advice` | Sender left/right direction bits |
 | `receiver_merkle_siblings` | `Vec<[u8; 32]>` | `advice` | Receiver Merkle sibling nodes |
@@ -52,7 +53,7 @@ staging artifact, not the long-term circuit I/O model.
 
 ### C1: Sender oracle authorization
 ```
-Ed25519Verify(
+SchnorrVerify(
     pk  = oracle_pubkey,
     msg = Poseidon(sender_pubkey),
     sig = sender_oracle_sig
@@ -61,7 +62,7 @@ Ed25519Verify(
 
 ### C2: Receiver oracle authorization
 ```
-Ed25519Verify(
+SchnorrVerify(
     pk  = oracle_pubkey,
     msg = Poseidon(receiver_pubkey),
     sig = receiver_oracle_sig
@@ -101,11 +102,19 @@ while reusing a valid tx_hash.
 | Gate | Purpose | Degree |
 |---|---|---|
 | Poseidon hash gate | Hash sender/receiver leaves, Merkle parents, tx commitment | 3 |
-| Ed25519 verify gate | Verify oracle signatures for sender and receiver | 5 |
+| Oracle auth gate | Verify Schnorr-style oracle authorization for sender and receiver | 5 |
 | Merkle path gate | Verify binary Merkle path at each level | 4 |
 | Range check (lookup) | Constrain `amount` to u64 range | 2 |
 
 Target maximum gate degree: 5 (within the PLONK degree bound of 8).
+
+## ADR
+
+The oracle authorization scheme is no longer specified as Ed25519. The project
+controls the compliance oracle, so the canonical production direction is now a
+circuit-friendly Schnorr-style signature scheme over a proving-system-friendly
+curve. XRPL transaction parties remain Ed25519 pubkeys; only the oracle's own
+authorization primitive changes.
 
 ## Soundness Note
 

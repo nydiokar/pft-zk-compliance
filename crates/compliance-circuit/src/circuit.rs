@@ -127,6 +127,12 @@ pub struct Witness {
     pub sender_pubkey: [u8; 32],
     /// Receiver XRPL ed25519 public key (32 bytes).
     pub receiver_pubkey: [u8; 32],
+    /// Compliance oracle ed25519 public key (32 bytes).
+    ///
+    /// This is kept private at the witness boundary for now; the circuit binds
+    /// it to the public `oracle_pubkey_hash` and will use it directly once the
+    /// in-circuit Ed25519 gadget lands.
+    pub oracle_pubkey: [u8; 32],
     /// Transaction amount.
     pub amount: u64,
     /// Compliance oracle signature over `Poseidon(sender_pubkey)`.
@@ -723,10 +729,11 @@ where
         assign_u8_range_table(&config, &mut layouter)?;
 
         // ── Region 1: Load private witness ──────────────────────────────
-        // Assign sender, receiver, amount as single field elements.
+        // Assign sender, receiver, oracle pubkey, and amount as single field
+        // elements.
         // These cells are re-used (via copy-constraints) in every later region
         // so the prover cannot substitute different values per gate.
-        let (sender_cell, receiver_cell, amount_cell) = layouter.assign_region(
+        let (sender_cell, receiver_cell, oracle_pubkey_cell, amount_cell) = layouter.assign_region(
             || "load_witness",
             |mut region: Region<'_, F>| {
                 let sender_val = self
@@ -737,12 +744,18 @@ where
                     .witness
                     .as_ref()
                     .map(|w| bytes_to_field::<F>(&w.receiver_pubkey));
+                let oracle_pubkey_val = self
+                    .witness
+                    .as_ref()
+                    .map(|w| bytes_to_field::<F>(&w.oracle_pubkey));
                 let amount_val = self.witness.as_ref().map(|w| F::from(w.amount));
 
                 let s = region.assign_advice(|| "sender", config.a, 0, || sender_val)?;
                 let r = region.assign_advice(|| "receiver", config.b, 0, || receiver_val)?;
-                let am = region.assign_advice(|| "amount", config.c, 0, || amount_val)?;
-                Ok((s, r, am))
+                let o =
+                    region.assign_advice(|| "oracle_pubkey", config.c, 0, || oracle_pubkey_val)?;
+                let am = region.assign_advice(|| "amount", config.d, 0, || amount_val)?;
+                Ok((s, r, o, am))
             },
         )?;
 
@@ -885,13 +898,13 @@ where
         )?;
 
         // ── Wire oracle_pubkey_hash → instance column (row 64) ───────────
-        let oracle_hash_cell: AssignedCell<F, F> = layouter.assign_region(
-            || "oracle_pubkey_hash",
-            |mut region: Region<'_, F>| {
-                let oracle_hash_val =
-                    Value::known(bytes_to_field::<F>(&self.public.oracle_pubkey_hash));
-                region.assign_advice(|| "oracle_pubkey_hash", config.a, 0, || oracle_hash_val)
-            },
+        let oracle_hash_cell = assign_single_input_poseidon_region(
+            &config,
+            &mut layouter,
+            "oracle_pubkey_hash",
+            oracle_pubkey_cell,
+            &poseidon_constants,
+            &poseidon_mds,
         )?;
         layouter.constrain_instance(
             oracle_hash_cell.cell(),
@@ -1136,6 +1149,7 @@ mod tests {
         let receiver_pubkey: [u8; 32] = [0x02u8; 32];
         let sender_oracle_sig: [u8; 64] = [0x03u8; 64];
         let receiver_oracle_sig: [u8; 64] = [0x04u8; 64];
+        let oracle_pubkey: [u8; 32] = [0x05u8; 32];
         let amount: u64 = 999;
         let block_height: u64 = 1_000_000;
 
@@ -1173,7 +1187,8 @@ mod tests {
         );
 
         let compliance_merkle_root: [u8; 32] = field_to_bytes(root_f);
-        let oracle_pubkey_hash: [u8; 32] = field_to_bytes(Fr::from(0xA11CE_u64));
+        let oracle_pubkey_hash: [u8; 32] =
+            field_to_bytes(merkle_leaf_hash_from_pubkey(&oracle_pubkey));
 
         let public = PublicInputs {
             tx_hash,
@@ -1184,6 +1199,7 @@ mod tests {
         let witness = Witness {
             sender_pubkey,
             receiver_pubkey,
+            oracle_pubkey,
             amount,
             sender_oracle_sig,
             receiver_oracle_sig,
@@ -1320,6 +1336,20 @@ mod tests {
         assert!(
             prover.verify().is_err(),
             "Wrong Merkle direction bit should cause verify() to fail"
+        );
+    }
+
+    #[test]
+    fn test_wrong_oracle_pubkey_fails_hash_binding() {
+        let (mut circuit, instance) = make_fixture();
+        circuit.witness = circuit.witness.map(|mut w| {
+            w.oracle_pubkey[0] ^= 0xFF;
+            w
+        });
+        let prover = MockProver::<Fr>::run(10, &circuit, instance).expect("MockProver::run failed");
+        assert!(
+            prover.verify().is_err(),
+            "Wrong oracle pubkey should fail the oracle_pubkey_hash binding"
         );
     }
 }

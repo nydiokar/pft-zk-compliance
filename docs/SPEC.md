@@ -98,7 +98,7 @@ the proof to a specific transaction and a specific compliance snapshot.
 |---|---|---|---|
 | `tx_hash` | `[u8; 32]` | 32 × `Instance` | Poseidon hash of `(sender_pubkey ‖ receiver_pubkey ‖ amount)` |
 | `compliance_merkle_root` | `[u8; 32]` | 32 × `Instance` | Root of the oracle-signed compliance pubkey Merkle tree at `block_height` |
-| `oracle_pubkey_hash` | `[u8; 32]` | 32 × `Instance` | Poseidon hash of the compliance oracle's ed25519 public key |
+| `oracle_pubkey_hash` | `[u8; 32]` | 32 × `Instance` | Poseidon hash of the active compliance oracle public key |
 | `block_height` | `u64` | 1 × `Instance` | Block at which the compliance snapshot was taken |
 
 Total public instance cells: **97**
@@ -116,19 +116,22 @@ They constitute the zero-knowledge witness.
 |---|---|---|
 | `sender_pubkey` | `[u8; 32]` | Sender XRPL ed25519 public key (32 bytes) |
 | `receiver_pubkey` | `[u8; 32]` | Receiver XRPL ed25519 public key |
+| `oracle_pubkey` | `[u8; 32]` | Compliance oracle public key for the circuit-friendly authorization scheme |
 | `amount` | `u64` | Transaction amount in drops |
-| `sender_oracle_sig` | `[u8; 64]` | Ed25519 signature from compliance oracle over `Poseidon(sender_pubkey)` |
-| `receiver_oracle_sig` | `[u8; 64]` | Ed25519 signature from compliance oracle over `Poseidon(receiver_pubkey)` |
+| `sender_oracle_sig` | `[u8; 64]` | Oracle authorization signature over `Poseidon(sender_pubkey)` |
+| `receiver_oracle_sig` | `[u8; 64]` | Oracle authorization signature over `Poseidon(receiver_pubkey)` |
 | `sender_merkle_siblings` | `Vec<[u8; 32]>` | Sender Merkle sibling nodes (depth 20) |
 | `sender_merkle_directions` | `Vec<bool>` | Sender per-level position bits (`false = current node is left`, `true = current node is right`) |
 | `receiver_merkle_siblings` | `Vec<[u8; 32]>` | Receiver Merkle sibling nodes (depth 20) |
 | `receiver_merkle_directions` | `Vec<bool>` | Receiver per-level position bits (`false = current node is left`, `true = current node is right`) |
 
-**Oracle signature model:** The Post Fiat compliance oracle (currently the
-LLM-based OFAC screener) signs each pubkey it has cleared: `sig = oracle_sign(Poseidon(pubkey))`.
-The ZK circuit proves the prover holds valid oracle signatures for both sender
-and receiver — without revealing the pubkeys, the signatures, or the Merkle
-paths to any verifier.
+**Oracle authorization model:** The Post Fiat compliance oracle (currently the
+LLM-based OFAC screener) signs each pubkey it has cleared:
+`sig = oracle_sign(Poseidon(pubkey))`. Because the oracle scheme is under
+protocol control, the canonical production direction is now a circuit-friendly
+Schnorr-style signature scheme rather than Ed25519. The ZK circuit proves the
+prover holds valid oracle authorizations for both sender and receiver — without
+revealing the pubkeys, the signatures, or the Merkle paths to any verifier.
 
 Merkle tree depth 20 supports up to **~1M cleared pubkeys**.
 
@@ -158,18 +161,18 @@ Temporary implementation note:
 
 The circuit enforces five constraints simultaneously:
 
-**C1 — Sender oracle signature valid:**
+**C1 — Sender oracle authorization valid:**
 ```
-Ed25519Verify(
+SchnorrVerify(
     pk  = oracle_pubkey,
     msg = Poseidon(sender_pubkey),
     sig = sender_oracle_sig
 ) = 1
 ```
 
-**C2 — Receiver oracle signature valid:**
+**C2 — Receiver oracle authorization valid:**
 ```
-Ed25519Verify(
+SchnorrVerify(
     pk  = oracle_pubkey,
     msg = Poseidon(receiver_pubkey),
     sig = receiver_oracle_sig
@@ -205,20 +208,21 @@ C5 prevents reusing a valid proof for a different transaction.
 C1+C2 ensure the oracle actually cleared both parties, while C3+C4 prove those
 same parties are members of the published compliance snapshot. Merkle membership
 alone is insufficient because the Merkle tree could be stale; the oracle
-signature carries a freshness guarantee via oracle key rotation.
+authorization carries a freshness guarantee via oracle key rotation.
 
 ### 2.4 Gate Architecture
 
 | Gate | Constraints | Max degree |
 |---|---|---|
 | Poseidon hash gate | C3/C4 leaf hashing, C5 tx binding, Merkle parent hashing | 3 |
-| Ed25519 verify gate | C1, C2 oracle sig verification | 5 |
+| Oracle auth gate | C1, C2 oracle authorization verification | 5 |
 | Merkle path gate | C3/C4 membership (one level per row) | 4 |
 | Range check (lookup) | `amount` fits in u64 | 2 |
 
 Target maximum gate degree: **5** (within the PLONK degree bound of 8).
-Ed25519 in-circuit is the most expensive gate — its degree-5 constraint is
-dominated by the scalar multiplication check.
+Oracle authorization is expected to be one of the most expensive components,
+which is why the canonical design now prefers a circuit-friendly Schnorr-style
+scheme instead of Ed25519.
 
 ### 2.5 Rust Struct Layout
 
@@ -233,6 +237,7 @@ pub struct ComplianceCircuit {
     // Private — witness only
     pub sender_pubkey:      Value<[u8; 32]>,
     pub receiver_pubkey:    Value<[u8; 32]>,
+    pub oracle_pubkey:      Value<[u8; 32]>,
     pub amount:             Value<u64>,
     pub sender_oracle_sig:       Value<[u8; 64]>,
     pub receiver_oracle_sig:     Value<[u8; 64]>,
@@ -499,7 +504,7 @@ holds under the zero-knowledge property of PLONK:
 | Stale/forged Merkle root | `block_height` is a public input; validators cross-check root against on-chain state at that height |
 | Replay of a valid proof for a different tx | C4 (hash binding) ties proof to specific `tx_hash`; reuse fails verification |
 | Prover equivocation (two valid proofs for conflicting txs) | Not possible with a deterministic circuit; same inputs always produce the same public outputs |
-| Forged oracle signature in witness | C1+C2 verify ed25519 sig inside the circuit against `oracle_pubkey_hash` (public); cannot forge without oracle private key |
+| Forged oracle authorization in witness | C1+C2 verify the oracle authorization scheme inside the circuit against `oracle_pubkey_hash` (public); cannot forge without oracle private key |
 | Expired oracle key reuse | Validators reject proofs whose `oracle_pubkey_hash` doesn't match the current on-chain oracle key registration |
 | Oracle compromise (oracle signs non-compliant pubkeys) | Oracle key rotation invalidates all existing proofs; network upgrade required to accept new oracle key |
 
@@ -516,17 +521,16 @@ Halo2 PLONK proof generation time scales with the number of circuit rows
 |---|---|
 | Merkle depth | 20 levels |
 | Poseidon rounds per hash | ~60 constraints |
-| Ed25519 verify gate (×2, sender + receiver) | ~3,000 constraints each |
+| Oracle auth verification (×2, sender + receiver) | signature-scheme dependent |
 | Estimated total rows | ~8,000 |
 | Estimated proof time (laptop CPU) | 800–1,500 ms |
 | Estimated proof time (server, AVX2) | 300–600 ms |
 
-The ed25519 in-circuit verification (C1+C2) roughly doubles circuit size vs the
-v1.0 Merkle-only design. This is the cost of oracle signature verification —
-it's justified by the stronger compliance guarantee. If proof time is a concern,
-the ed25519 gate can be replaced with a cheaper Schnorr-over-Pasta construction
-using native field arithmetic, reducing the gate to degree 3 and cutting proof
-time back to v1.0 levels. This is tracked as a future optimisation.
+Because the oracle scheme is under protocol control, the canonical production
+path is a Schnorr-over-Pasta-style construction rather than Ed25519. That
+reduces implementation risk, avoids non-native Edwards arithmetic in the Halo2
+circuit, and is expected to materially reduce proving cost versus the earlier
+Ed25519-based draft.
 
 Post Fiat target block time: **~1 second**. With a `PROOF_TIMEOUT_MS` of 2000 ms
 and server-class hardware, proof generation fits comfortably within the block
@@ -659,4 +663,4 @@ Key metrics to expose (Prometheus-compatible):
 - [Halo2 book](https://zcash.github.io/halo2/)
 - [Poseidon hash paper](https://eprint.iacr.org/2019/458)
 - [PLONK paper](https://eprint.iacr.org/2019/953)
-- [Ed25519 spec (RFC 8032)](https://www.rfc-editor.org/rfc/rfc8032)
+- [Schnorr identification and signatures](https://www.iacr.org/cryptodb/data/paper.php?pubkey=14302)
