@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2" }
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
 ff = "0.13"
 group = "0.13"
 halo2_poseidon = "0.1.0"

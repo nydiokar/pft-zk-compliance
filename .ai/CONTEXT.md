@@ -1,6 +1,6 @@
 # pf-zk-compliance — Project Context
 
-**Branch:** `master`  **Last Updated:** 2026-03-29  **Status:** Real proof generation done — `create_proof` + Blake2b transcript, pk/params loaded at startup; ZK-14 lookup-backed u64 range check complete; oracle key witness/hash binding landed; canonical direction changed from Ed25519 oracle authorization to a circuit-friendly Schnorr-style oracle scheme
+**Branch:** `master`  **Last Updated:** 2026-04-02  **Status:** Real proof generation done — `create_proof` + Blake2b transcript, pk/params loaded at startup; ZK-14 lookup-backed u64 range check complete; oracle key witness/hash binding landed; Halo2 git dependency pinned across the sidecar build graph with documented upgrade steps; canonical direction changed from Ed25519 oracle authorization to a circuit-friendly Schnorr-style oracle scheme
 
 ---
 
@@ -46,7 +46,7 @@ The next work here is fairly clear from the current code and spec.
 | ✅ | **[ZK-14] Lookup table range check** | S | The tautological placeholder is gone. `amount` is now decomposed into eight 8-bit limbs, each constrained by a shared lookup table and recomposed back into the same witness value used by the Poseidon tx hash gate. Added pass/fail tests for valid u64 and non-u64 field values. |
 | [ ] | **[ZK-15] In-circuit oracle authorization** | L | Correct task after ZK-14. `oracle_pubkey` is now present in the witness/request path and the circuit binds `Poseidon(oracle_pubkey)` to public `oracle_pubkey_hash`; remaining work is the actual Schnorr-over-Pasta verification gadget for `sender_oracle_sig` over `Poseidon(sender_pubkey)` and `receiver_oracle_sig` over `Poseidon(receiver_pubkey)`, plus an ADR and circuit-level valid/tampered authorization tests. |
 | [ ] | **[ZK-16] postfiatd IPC hook** | L | C++ side of the socket interface in postfiatd. Calls sidecar before forwarding tx to RPCA consensus. Depends on ZK-9/10/11 being stable. **When implementing: add `tokio::sync::Semaphore` in `ProverState` to cap concurrent `spawn_blocking` proof jobs — each proof is ~100-300 MB at k=8, unbounded concurrency under burst load causes OOM. Limit should be a `--max-concurrent-proofs` CLI flag sized against real circuit memory at production k.** Integration target remains the Post Fiat `postfiatd` validator daemon described in `docs/SPEC.md`. |
-| [ ] | **[ZK-17] Pin halo2 git dep** | S | Add `rev = "<commit>"` to halo2_proofs git dep in all Cargo.toml files. Supply-chain hygiene before any production deployment. |
+| ✅ | **[ZK-17] Pin halo2 git dep** | S | `halo2_proofs` now pins `privacy-scaling-explorations/halo2` to `198e9ae30d322cd0ad003b6955f91ec095b1490d` in both `crates/compliance-sidecar` and `crates/compliance-circuit`. Added `DEPENDENCY_PINS.md`, refreshed local `Cargo.lock`, and verified with `cargo test -p compliance-sidecar --locked`. |
 
 ---
 
@@ -96,7 +96,7 @@ The next work here is fairly clear from the current code and spec.
 - **[ZK-10 done]** `verify_proof_multi` called after `create_proof` in `run_circuit`. VK loaded at startup via `vk_read` into `ProverState`. `serve --vk` flag added. Verify failure returns `"non_compliant"`; prover/decode errors return `"error"`. `cargo check` passes.
 - **[source of truth]** `docs/SPEC.md` is the target architecture. `.ai/CONTEXT.md` is the implementation-status ledger and may record approved deltas while the Rust workspace is moved toward the spec in stages. If code diverges from both, update docs or code so one of them explicitly explains the delta.
 - **[ZK-11 done]** Rust IPC/circuit boundary now uses `sender_pubkey` / `receiver_pubkey` (`[u8; 32]`) plus `sender_oracle_sig` / `receiver_oracle_sig` (`[u8; 64]`) and public `oracle_pubkey_hash`. Validation rejects malformed pubkey/oracle-field payloads before proving begins.
-- **[open]** PSE halo2 git dep is unpinned (`git = "..."` without a rev). Must pin to a specific commit before any production deployment.
+- **[ZK-17 done]** Halo2 is pinned to `198e9ae30d322cd0ad003b6955f91ec095b1490d` everywhere the sidecar build graph declares `halo2_proofs`. `DEPENDENCY_PINS.md` records the current revision and upgrade procedure, and the repo now allows tracking `Cargo.lock` so the resolved graph can be audited in Git.
 - **[ZK-12 done]** C3 transaction binding no longer uses the prototype linear gate. It now enforces a Poseidon-based hash path in `crates/compliance-circuit/src/circuit.rs`. The sidecar's proof-building test fixture was updated to derive the same `tx_hash` field value via the shared helper.
 - **[ZK-13 done]** Merkle membership now uses two fixed-depth binary Poseidon paths, one for sender and one for receiver, converging to the shared public `compliance_merkle_root`. Merkle leaves are `Poseidon(pubkey)`, matching `docs/SPEC.md` and `docs/circuit_io.md`.
 - **[ZK-14 done]** `amount` is now range-checked as a true u64 via an 8-bit lookup table plus linear recomposition. The same copied advice cell feeds both the range-check region and the C3 Poseidon binding, so the prover cannot swap in a different amount across regions.
