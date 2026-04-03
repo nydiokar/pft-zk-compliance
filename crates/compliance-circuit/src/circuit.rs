@@ -71,7 +71,10 @@ use halo2_poseidon::{
     Mds,
     Spec,
 };
+use halo2curves::bn256::Fr as Bn254Fr;
+use group::{ff::PrimeField, prime::PrimeCurveAffine, GroupEncoding};
 use group::ff::FromUniformBytes;
+use pasta_curves::pallas;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -129,19 +132,20 @@ pub struct Witness {
     pub sender_pubkey: [u8; 32],
     /// Receiver XRPL ed25519 public key (32 bytes).
     pub receiver_pubkey: [u8; 32],
-    /// Compliance oracle authorization key material (32 bytes).
+    /// Compressed canonical Pallas public key bytes for the compliance oracle.
     ///
-    /// The circuit constrains `Poseidon(oracle_pubkey)` to the public
-    /// `oracle_pubkey_hash`, then uses the same witness value in the
-    /// Schnorr-style authorization relation for both transaction parties.
+    /// The current staged circuit constrains `Poseidon(oracle_pubkey)` to the
+    /// public `oracle_pubkey_hash` and reuses the same bytes in the temporary
+    /// scalar authorization relation. A later verifier patch will replace that
+    /// relation with full non-native Pallas point arithmetic.
     pub oracle_pubkey: [u8; 32],
     /// Transaction amount.
     pub amount: u64,
-    /// Compliance oracle authorization transcript over
-    /// `Poseidon(sender_pubkey)`, encoded as `nonce || response`.
+    /// Canonical Schnorr `(R, s)` bytes over `Poseidon(sender_pubkey)`,
+    /// encoded as compressed point `R` (32 bytes) || scalar `s` (32 bytes).
     pub sender_oracle_sig: [u8; 64],
-    /// Compliance oracle authorization transcript over
-    /// `Poseidon(receiver_pubkey)`, encoded as `nonce || response`.
+    /// Canonical Schnorr `(R, s)` bytes over `Poseidon(receiver_pubkey)`,
+    /// encoded as compressed point `R` (32 bytes) || scalar `s` (32 bytes).
     pub receiver_oracle_sig: [u8; 64],
     /// Sender sibling nodes for the fixed-depth Merkle path.
     pub sender_merkle_siblings: Vec<[u8; 32]>,
@@ -153,6 +157,73 @@ pub struct Witness {
     /// Receiver per-level direction bits.
     /// `false` means current node is the left child, `true` means right child.
     pub receiver_merkle_directions: Vec<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CanonicalOraclePubkey {
+    encoded: [u8; 32],
+}
+
+impl CanonicalOraclePubkey {
+    pub fn from_bytes(encoded: [u8; 32]) -> Result<Self, String> {
+        parse_canonical_pallas_point(encoded, "oracle_pubkey")?;
+        require_bn254_field_encoding(
+            &encoded,
+            "oracle_pubkey",
+            "compressed Pallas public key does not fit the current BN254 witness encoding",
+        )?;
+
+        Ok(Self { encoded })
+    }
+
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.encoded
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CanonicalSchnorrSignature {
+    encoded_r: [u8; 32],
+    encoded_s: [u8; 32],
+}
+
+impl CanonicalSchnorrSignature {
+    pub fn from_bytes(encoded: [u8; 64]) -> Result<Self, String> {
+        let mut encoded_r = [0u8; 32];
+        encoded_r.copy_from_slice(&encoded[..32]);
+        parse_canonical_pallas_point(encoded_r, "R")?;
+        require_bn254_field_encoding(
+            &encoded_r,
+            "R",
+            "compressed Pallas point does not fit the current BN254 witness encoding",
+        )?;
+
+        let mut encoded_s = [0u8; 32];
+        encoded_s.copy_from_slice(&encoded[32..]);
+        parse_canonical_pallas_scalar(encoded_s, "s")?;
+        require_bn254_field_encoding(
+            &encoded_s,
+            "s",
+            "canonical Pallas scalar does not fit the current BN254 witness encoding",
+        )?;
+
+        Ok(Self { encoded_r, encoded_s })
+    }
+
+    pub fn to_bytes(&self) -> [u8; 64] {
+        let mut encoded = [0u8; 64];
+        encoded[..32].copy_from_slice(&self.encoded_r);
+        encoded[32..].copy_from_slice(&self.encoded_s);
+        encoded
+    }
+
+    pub fn r_bytes(&self) -> [u8; 32] {
+        self.encoded_r
+    }
+
+    pub fn s_bytes(&self) -> [u8; 32] {
+        self.encoded_s
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -426,6 +497,45 @@ fn bytes_to_field<F: ff::PrimeField>(bytes: &[u8]) -> F {
     })
 }
 
+fn parse_canonical_pallas_point(bytes: [u8; 32], label: &str) -> Result<pallas::Affine, String> {
+    let point = pallas::Affine::from_bytes(&bytes)
+        .into_option()
+        .ok_or_else(|| format!("{label}: invalid compressed Pallas point encoding"))?;
+
+    if bool::from(point.is_identity()) {
+        return Err(format!("{label}: identity point is not allowed"));
+    }
+
+    Ok(point)
+}
+
+fn parse_canonical_pallas_scalar(bytes: [u8; 32], label: &str) -> Result<pallas::Scalar, String> {
+    pallas::Scalar::from_repr(bytes)
+        .into_option()
+        .ok_or_else(|| format!("{label}: non-canonical Pallas scalar encoding"))
+}
+
+fn require_bn254_field_encoding(
+    bytes: &[u8; 32],
+    label: &str,
+    reason: &str,
+) -> Result<(), String> {
+    Bn254Fr::from_repr((*bytes).into())
+        .into_option()
+        .map(|_| ())
+        .ok_or_else(|| format!("{label}: {reason}"))
+}
+
+pub fn canonical_oracle_pubkey_from_bytes(bytes: [u8; 32]) -> Result<CanonicalOraclePubkey, String> {
+    CanonicalOraclePubkey::from_bytes(bytes)
+}
+
+pub fn canonical_schnorr_signature_from_bytes(
+    bytes: [u8; 64],
+) -> Result<CanonicalSchnorrSignature, String> {
+    CanonicalSchnorrSignature::from_bytes(bytes)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TxHashPoseidonSpec;
 
@@ -520,19 +630,19 @@ pub fn oracle_signature_fields_from_bytes<F>(signature: &[u8; 64]) -> (F, F)
 where
     F: ff::PrimeField,
 {
-    let mut nonce = [0u8; 32];
-    nonce.copy_from_slice(&signature[..32]);
+    let mut encoded_r = [0u8; 32];
+    encoded_r.copy_from_slice(&signature[..32]);
     let mut response = [0u8; 32];
     response.copy_from_slice(&signature[32..]);
-    (bytes_to_field::<F>(&nonce), bytes_to_field::<F>(&response))
+    (bytes_to_field::<F>(&encoded_r), bytes_to_field::<F>(&response))
 }
 
-pub fn oracle_signature_bytes<F>(nonce: F, response: F) -> [u8; 64]
+pub fn oracle_signature_bytes<F>(encoded_r_field: F, response: F) -> [u8; 64]
 where
     F: ff::PrimeField,
 {
     let mut signature = [0u8; 64];
-    signature[..32].copy_from_slice(nonce.to_repr().as_ref());
+    signature[..32].copy_from_slice(encoded_r_field.to_repr().as_ref());
     signature[32..].copy_from_slice(response.to_repr().as_ref());
     signature
 }
@@ -1244,8 +1354,10 @@ where
 mod tests {
     use super::*;
     use ff::{Field, PrimeField};
+    use group::Group;
     use halo2_proofs::{circuit::Value, dev::MockProver};
     use halo2curves::bn256::Fr;
+    use pasta_curves::group::Curve;
 
     #[derive(Clone, Debug)]
     struct AmountRangeTestCircuit {
@@ -1335,20 +1447,47 @@ mod tests {
             })
     }
 
-    fn sign_authorization(oracle_pubkey: [u8; 32], authorized_pubkey: [u8; 32], nonce_seed: u64) -> [u8; 64] {
+    fn fits_bn254_witness_encoding(bytes: [u8; 32]) -> bool {
+        Fr::from_repr(bytes.into()).into_option().is_some()
+    }
+
+    fn compatible_pallas_point_bytes(start_scalar: u64) -> [u8; 32] {
+        for scalar in start_scalar..start_scalar + 10_000 {
+            let encoded_r = (pallas::Point::generator() * pallas::Scalar::from(scalar))
+                .to_affine()
+                .to_bytes();
+            if fits_bn254_witness_encoding(encoded_r) {
+                return encoded_r;
+            }
+        }
+
+        panic!("expected to find a compressed Pallas point compatible with BN254 witness encoding");
+    }
+
+    fn sign_authorization(
+        oracle_pubkey: [u8; 32],
+        authorized_pubkey: [u8; 32],
+        nonce_seed: u64,
+    ) -> [u8; 64] {
+        let encoded_r_point = compatible_pallas_point_bytes(nonce_seed);
+        let encoded_r_field = bytes_to_field::<Fr>(&encoded_r_point);
         let oracle_key = bytes_to_field::<Fr>(&oracle_pubkey);
         let oracle_hash = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey);
         let authorized_hash = merkle_leaf_hash_from_pubkey::<Fr>(&authorized_pubkey);
-        let nonce = Fr::from(nonce_seed);
-        let challenge = oracle_authorization_challenge(oracle_hash, authorized_hash, nonce);
-        let response = nonce + challenge * oracle_key;
-        oracle_signature_bytes(nonce, response)
+        let challenge =
+            oracle_authorization_challenge(oracle_hash, authorized_hash, encoded_r_field);
+        let response = encoded_r_field + challenge * oracle_key;
+
+        let mut encoded = [0u8; 64];
+        encoded[..32].copy_from_slice(&encoded_r_point);
+        encoded[32..].copy_from_slice(response.to_repr().as_ref());
+        encoded
     }
 
     fn make_fixture() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
         let sender_pubkey: [u8; 32] = [0x01u8; 32];
         let receiver_pubkey: [u8; 32] = [0x02u8; 32];
-        let oracle_pubkey: [u8; 32] = [0x05u8; 32];
+        let oracle_pubkey: [u8; 32] = compatible_pallas_point_bytes(17);
         let sender_oracle_sig = sign_authorization(oracle_pubkey, sender_pubkey, 7);
         let receiver_oracle_sig = sign_authorization(oracle_pubkey, receiver_pubkey, 11);
         let amount: u64 = 999;

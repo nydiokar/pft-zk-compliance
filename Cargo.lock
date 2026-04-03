@@ -206,6 +206,7 @@ dependencies = [
  "halo2_poseidon",
  "halo2_proofs",
  "halo2curves",
+ "pasta_curves",
  "rand",
 ]
 
@@ -219,6 +220,7 @@ dependencies = [
  "halo2_proofs",
  "halo2curves",
  "hex",
+ "pasta_curves",
  "rand",
  "rand_core",
  "serde",

@@ -1,0 +1,936 @@
+From 542bb56f4e53b7d1045a4e72be227963da1cfcf7 Mon Sep 17 00:00:00 2001
+From: nydiokar <nydiokar@gmail.com>
+Date: Thu, 2 Apr 2026 23:20:40 +0000
+Subject: [PATCH] Move oracle authorization into circuit
+
+---
+ Cargo.lock                                    | 131 --------
+ crates/compliance-circuit/src/circuit.rs      | 298 +++++++++++++++---
+ crates/compliance-sidecar/Cargo.toml          |   1 -
+ crates/compliance-sidecar/src/main.rs         | 137 +++-----
+ ...schnorr-over-pasta-oracle-authorization.md |  46 +++
+ 5 files changed, 353 insertions(+), 260 deletions(-)
+ create mode 100644 docs/adr/0001-schnorr-over-pasta-oracle-authorization.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index c43c973..b95e0d0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -76,12 +76,6 @@ version = "0.22.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+ 
+-[[package]]
+-name = "base64ct"
+-version = "1.8.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+-
+ [[package]]
+ name = "bitflags"
+ version = "2.11.0"
+@@ -222,7 +216,6 @@ dependencies = [
+  "base64",
+  "clap",
+  "compliance-circuit",
+- "ed25519-dalek",
+  "halo2_proofs",
+  "halo2curves",
+  "hex",
+@@ -233,12 +226,6 @@ dependencies = [
+  "tokio",
+ ]
+ 
+-[[package]]
+-name = "const-oid"
+-version = "0.9.6"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+-
+ [[package]]
+ name = "constant_time_eq"
+ version = "0.4.2"
+@@ -289,43 +276,6 @@ dependencies = [
+  "typenum",
+ ]
+ 
+-[[package]]
+-name = "curve25519-dalek"
+-version = "4.1.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
+-dependencies = [
+- "cfg-if",
+- "cpufeatures",
+- "curve25519-dalek-derive",
+- "digest 0.10.7",
+- "fiat-crypto",
+- "rustc_version",
+- "subtle",
+- "zeroize",
+-]
+-
+-[[package]]
+-name = "curve25519-dalek-derive"
+-version = "0.1.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
+-dependencies = [
+- "proc-macro2",
+- "quote",
+- "syn 2.0.117",
+-]
+-
+-[[package]]
+-name = "der"
+-version = "0.7.10"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
+-dependencies = [
+- "const-oid",
+- "zeroize",
+-]
+-
+ [[package]]
+ name = "digest"
+ version = "0.9.0"
+@@ -346,31 +296,6 @@ dependencies = [
+  "subtle",
+ ]
+ 
+-[[package]]
+-name = "ed25519"
+-version = "2.2.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+-dependencies = [
+- "pkcs8",
+- "signature",
+-]
+-
+-[[package]]
+-name = "ed25519-dalek"
+-version = "2.2.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+-dependencies = [
+- "curve25519-dalek",
+- "ed25519",
+- "rand_core",
+- "serde",
+- "sha2",
+- "subtle",
+- "zeroize",
+-]
+-
+ [[package]]
+ name = "either"
+ version = "1.15.0"
+@@ -398,12 +323,6 @@ dependencies = [
+  "subtle",
+ ]
+ 
+-[[package]]
+-name = "fiat-crypto"
+-version = "0.2.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+-
+ [[package]]
+ name = "funty"
+ version = "2.0.0"
+@@ -727,16 +646,6 @@ version = "0.2.17"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+ 
+-[[package]]
+-name = "pkcs8"
+-version = "0.10.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
+-dependencies = [
+- "der",
+- "spki",
+-]
+-
+ [[package]]
+ name = "ppv-lite86"
+ version = "0.2.21"
+@@ -829,27 +738,12 @@ dependencies = [
+  "bitflags",
+ ]
+ 
+-[[package]]
+-name = "rustc_version"
+-version = "0.4.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+-dependencies = [
+- "semver",
+-]
+-
+ [[package]]
+ name = "scopeguard"
+ version = "1.2.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+ 
+-[[package]]
+-name = "semver"
+-version = "1.0.27"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+-
+ [[package]]
+ name = "serde"
+ version = "1.0.228"
+@@ -926,15 +820,6 @@ dependencies = [
+  "libc",
+ ]
+ 
+-[[package]]
+-name = "signature"
+-version = "2.2.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+-dependencies = [
+- "rand_core",
+-]
+-
+ [[package]]
+ name = "smallvec"
+ version = "1.15.1"
+@@ -957,16 +842,6 @@ version = "0.9.8"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+ 
+-[[package]]
+-name = "spki"
+-version = "0.7.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
+-dependencies = [
+- "base64ct",
+- "der",
+-]
+-
+ [[package]]
+ name = "static_assertions"
+ version = "1.1.0"
+@@ -1230,12 +1105,6 @@ dependencies = [
+  "syn 2.0.117",
+ ]
+ 
+-[[package]]
+-name = "zeroize"
+-version = "1.8.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+-
+ [[package]]
+ name = "zmij"
+ version = "1.0.21"
+diff --git a/crates/compliance-circuit/src/circuit.rs b/crates/compliance-circuit/src/circuit.rs
+index d189417..86a94b7 100644
+--- a/crates/compliance-circuit/src/circuit.rs
++++ b/crates/compliance-circuit/src/circuit.rs
+@@ -4,9 +4,13 @@
+ //!
+ //! Without revealing any witness data, the circuit proves:
+ //!
+-//!   C1. `sender_pubkey`   ∈ compliance_list  (Merkle membership)
+-//!   C2. `receiver_pubkey` ∈ compliance_list  (Merkle membership)
+-//!   C3. `commit(sender_pubkey ‖ receiver_pubkey ‖ amount) = tx_hash`
++//!   C1. `sender_oracle_sig` authorizes `Poseidon(sender_pubkey)` under the
++//!       constrained oracle key
++//!   C2. `receiver_oracle_sig` authorizes `Poseidon(receiver_pubkey)` under the
++//!       constrained oracle key
++//!   C3. `sender_pubkey`   ∈ compliance_list  (Merkle membership)
++//!   C4. `receiver_pubkey` ∈ compliance_list  (Merkle membership)
++//!   C5. `commit(sender_pubkey ‖ receiver_pubkey ‖ amount) = tx_hash`
+ //!       (hash binding)
+ //!
+ //! # Public / private split
+@@ -31,6 +35,7 @@
+ //! |-------------------|-------------------------------------|--------|
+ //! | `tx_hash_poseidon`| Poseidon round transition           | 5      |
+ //! | `merkle_path`     | direction bit + child ordering      | 2      |
++//! | `auth_muladd`     | `response = nonce + challenge * sk` | 2      |
+ //! | `range_check`     | 8-bit lookup decomposition of u64   | 1      |
+ //!
+ //! # Prototype substitutions
+@@ -112,9 +117,6 @@ pub struct PublicInputs {
+     /// Root of the compliance pubkey Merkle tree at `block_height`.
+     pub compliance_merkle_root: [u8; 32],
+     /// Poseidon hash of the active compliance oracle public key.
+-    ///
+-    /// PROTOTYPE: carried through the public-input interface and verifier
+-    /// plumbing, but not yet used by an in-circuit Ed25519 gadget.
+     pub oracle_pubkey_hash: [u8; 32],
+     /// Block height of the compliance snapshot.
+     pub block_height: u64,
+@@ -127,23 +129,19 @@ pub struct Witness {
+     pub sender_pubkey: [u8; 32],
+     /// Receiver XRPL ed25519 public key (32 bytes).
+     pub receiver_pubkey: [u8; 32],
+-    /// Compliance oracle ed25519 public key (32 bytes).
++    /// Compliance oracle authorization key material (32 bytes).
+     ///
+-    /// This is kept private at the witness boundary for now; the circuit binds
+-    /// it to the public `oracle_pubkey_hash` and will use it directly once the
+-    /// in-circuit Ed25519 gadget lands.
++    /// The circuit constrains `Poseidon(oracle_pubkey)` to the public
++    /// `oracle_pubkey_hash`, then uses the same witness value in the
++    /// Schnorr-style authorization relation for both transaction parties.
+     pub oracle_pubkey: [u8; 32],
+     /// Transaction amount.
+     pub amount: u64,
+-    /// Compliance oracle signature over `Poseidon(sender_pubkey)`.
+-    ///
+-    /// PROTOTYPE: stored in the witness boundary but not yet constrained until
+-    /// the Ed25519 verification gadget lands.
++    /// Compliance oracle authorization transcript over
++    /// `Poseidon(sender_pubkey)`, encoded as `nonce || response`.
+     pub sender_oracle_sig: [u8; 64],
+-    /// Compliance oracle signature over `Poseidon(receiver_pubkey)`.
+-    ///
+-    /// PROTOTYPE: stored in the witness boundary but not yet constrained until
+-    /// the Ed25519 verification gadget lands.
++    /// Compliance oracle authorization transcript over
++    /// `Poseidon(receiver_pubkey)`, encoded as `nonce || response`.
+     pub receiver_oracle_sig: [u8; 64],
+     /// Sender sibling nodes for the fixed-depth Merkle path.
+     pub sender_merkle_siblings: Vec<[u8; 32]>,
+@@ -186,6 +184,8 @@ pub struct ComplianceConfig {
+     pub s_merkle: Selector,
+     /// Selector: activates the range-check gate (amount ∈ u64).
+     pub s_range: Selector,
++    /// Selector: activates the Schnorr-style linear response check.
++    pub s_auth_muladd: Selector,
+     /// Lookup table for a single 8-bit limb used by the u64 range check.
+     pub range_u8_table: TableColumn,
+ }
+@@ -222,6 +222,7 @@ impl ComplianceConfig {
+         let s_poseidon_partial = meta.selector();
+         let s_merkle = meta.selector();
+         let s_range = meta.complex_selector();
++        let s_auth_muladd = meta.selector();
+ 
+         let mds = poseidon_mds::<F>();
+         let pow_5 = |value: Expression<F>| {
+@@ -361,6 +362,16 @@ impl ComplianceConfig {
+             vec![(s * vc.query_advice(a, Rotation(2)), range_u8_table)]
+         });
+ 
++        meta.create_gate("auth_muladd", |vc| {
++            let s = vc.query_selector(s_auth_muladd);
++            let nonce = vc.query_advice(a, Rotation::cur());
++            let challenge = vc.query_advice(b, Rotation::cur());
++            let oracle_key = vc.query_advice(c, Rotation::cur());
++            let response = vc.query_advice(d, Rotation::cur());
++
++            vec![s * (response - (nonce + challenge * oracle_key))]
++        });
++
+         ComplianceConfig {
+             a,
+             b,
+@@ -373,6 +384,7 @@ impl ComplianceConfig {
+             s_poseidon_partial,
+             s_merkle,
+             s_range,
++            s_auth_muladd,
+             range_u8_table,
+         }
+     }
+@@ -497,6 +509,34 @@ where
+     poseidon_hash_words([left, right])
+ }
+ 
++pub fn oracle_authorization_challenge<F>(oracle_pubkey_hash: F, authorized_key_hash: F, nonce: F) -> F
++where
++    F: ff::PrimeField + FromUniformBytes<64> + Ord,
++{
++    poseidon_hash_words([oracle_pubkey_hash, authorized_key_hash, nonce])
++}
++
++pub fn oracle_signature_fields_from_bytes<F>(signature: &[u8; 64]) -> (F, F)
++where
++    F: ff::PrimeField,
++{
++    let mut nonce = [0u8; 32];
++    nonce.copy_from_slice(&signature[..32]);
++    let mut response = [0u8; 32];
++    response.copy_from_slice(&signature[32..]);
++    (bytes_to_field::<F>(&nonce), bytes_to_field::<F>(&response))
++}
++
++pub fn oracle_signature_bytes<F>(nonce: F, response: F) -> [u8; 64]
++where
++    F: ff::PrimeField,
++{
++    let mut signature = [0u8; 64];
++    signature[..32].copy_from_slice(nonce.to_repr().as_ref());
++    signature[32..].copy_from_slice(response.to_repr().as_ref());
++    signature
++}
++
+ fn pow5_field<F: ff::PrimeField>(value: F) -> F {
+     value.pow_vartime([5])
+ }
+@@ -691,6 +731,94 @@ where
+     )
+ }
+ 
++fn assign_three_input_poseidon_region<F>(
++    config: &ComplianceConfig,
++    layouter: &mut impl Layouter<F>,
++    name: &'static str,
++    first: AssignedCell<F, F>,
++    second: AssignedCell<F, F>,
++    third: AssignedCell<F, F>,
++    poseidon_constants: &[[F; TX_POSEIDON_WIDTH]],
++    poseidon_mds: &Mds<F, TX_POSEIDON_WIDTH>,
++) -> Result<AssignedCell<F, F>, ErrorFront>
++where
++    F: ff::PrimeField + FromUniformBytes<64> + Ord,
++{
++    layouter.assign_region(
++        || name,
++        |mut region: Region<'_, F>| {
++            first.copy_advice(|| "poseidon_input_0", &mut region, config.a, 0)?;
++            second.copy_advice(|| "poseidon_input_1", &mut region, config.b, 0)?;
++            third.copy_advice(|| "poseidon_input_2", &mut region, config.c, 0)?;
++            region.assign_advice_from_constant(
++                || "poseidon_capacity",
++                config.d,
++                0,
++                poseidon_domain_tag::<F>(TX_POSEIDON_RATE),
++            )?;
++
++            assign_poseidon_permutation(
++                config,
++                &mut region,
++                0,
++                [
++                    first.value().copied(),
++                    second.value().copied(),
++                    third.value().copied(),
++                    Value::known(poseidon_domain_tag::<F>(TX_POSEIDON_RATE)),
++                ],
++                poseidon_constants,
++                poseidon_mds,
++            )
++        },
++    )
++}
++
++fn assign_signature_scalar_region<F>(
++    config: &ComplianceConfig,
++    layouter: &mut impl Layouter<F>,
++    name: &'static str,
++    nonce: Value<F>,
++    response: Value<F>,
++) -> Result<(AssignedCell<F, F>, AssignedCell<F, F>), ErrorFront>
++where
++    F: ff::PrimeField,
++{
++    layouter.assign_region(
++        || name,
++        |mut region: Region<'_, F>| {
++            let nonce_cell = region.assign_advice(|| "nonce", config.a, 0, || nonce)?;
++            let response_cell = region.assign_advice(|| "response", config.b, 0, || response)?;
++            Ok((nonce_cell, response_cell))
++        },
++    )
++}
++
++fn assign_authorization_relation_region<F>(
++    config: &ComplianceConfig,
++    layouter: &mut impl Layouter<F>,
++    name: &'static str,
++    nonce: AssignedCell<F, F>,
++    challenge: AssignedCell<F, F>,
++    oracle_key: AssignedCell<F, F>,
++    response: AssignedCell<F, F>,
++) -> Result<(), ErrorFront>
++where
++    F: ff::PrimeField,
++{
++    layouter.assign_region(
++        || name,
++        |mut region: Region<'_, F>| {
++            config.s_auth_muladd.enable(&mut region, 0)?;
++            nonce.copy_advice(|| "nonce", &mut region, config.a, 0)?;
++            challenge.copy_advice(|| "challenge", &mut region, config.b, 0)?;
++            oracle_key.copy_advice(|| "oracle_key", &mut region, config.c, 0)?;
++            response.copy_advice(|| "response", &mut region, config.d, 0)?;
++            Ok(())
++        },
++    )
++}
++
+ // ─────────────────────────────────────────────────────────────────────────────
+ // ComplianceCircuit
+ // ─────────────────────────────────────────────────────────────────────────────
+@@ -818,7 +946,22 @@ where
+             TX_HASH_START, // row 0: the folded tx_hash field element
+         )?;
+ 
+-        // ── Regions 4 / 5: Merkle leaf hashes ────────────────────────────
++        // ── Region 4: Oracle key binding ─────────────────────────────────
++        let oracle_hash_cell = assign_single_input_poseidon_region(
++            &config,
++            &mut layouter,
++            "oracle_pubkey_hash",
++            oracle_pubkey_cell.clone(),
++            &poseidon_constants,
++            &poseidon_mds,
++        )?;
++        layouter.constrain_instance(
++            oracle_hash_cell.cell(),
++            config.instance,
++            ORACLE_PUBKEY_HASH_START,
++        )?;
++
++        // ── Regions 5 / 6: Merkle leaf hashes ────────────────────────────
+         // Spec membership statements use Poseidon(pubkey) as the leaf value.
+         let sender_leaf_cell = assign_single_input_poseidon_region(
+             &config,
+@@ -837,7 +980,70 @@ where
+             &poseidon_mds,
+         )?;
+ 
+-        // ── Merkle root field element (same for both C1 and C2) ──────────
++        // ── Regions 7..10: Oracle authorization (sender / receiver) ─────
++        let sender_sig_fields = self
++            .witness
++            .as_ref()
++            .map(|w| oracle_signature_fields_from_bytes::<F>(&w.sender_oracle_sig));
++        let (sender_nonce_cell, sender_response_cell) = assign_signature_scalar_region(
++            &config,
++            &mut layouter,
++            "sender_auth_signature",
++            sender_sig_fields.map(|(nonce, _)| nonce),
++            sender_sig_fields.map(|(_, response)| response),
++        )?;
++        let sender_challenge_cell = assign_three_input_poseidon_region(
++            &config,
++            &mut layouter,
++            "sender_auth_challenge",
++            oracle_hash_cell.clone(),
++            sender_leaf_cell.clone(),
++            sender_nonce_cell.clone(),
++            &poseidon_constants,
++            &poseidon_mds,
++        )?;
++        assign_authorization_relation_region(
++            &config,
++            &mut layouter,
++            "sender_auth_relation",
++            sender_nonce_cell,
++            sender_challenge_cell,
++            oracle_pubkey_cell.clone(),
++            sender_response_cell,
++        )?;
++
++        let receiver_sig_fields = self
++            .witness
++            .as_ref()
++            .map(|w| oracle_signature_fields_from_bytes::<F>(&w.receiver_oracle_sig));
++        let (receiver_nonce_cell, receiver_response_cell) = assign_signature_scalar_region(
++            &config,
++            &mut layouter,
++            "receiver_auth_signature",
++            receiver_sig_fields.map(|(nonce, _)| nonce),
++            receiver_sig_fields.map(|(_, response)| response),
++        )?;
++        let receiver_challenge_cell = assign_three_input_poseidon_region(
++            &config,
++            &mut layouter,
++            "receiver_auth_challenge",
++            oracle_hash_cell.clone(),
++            receiver_leaf_cell.clone(),
++            receiver_nonce_cell.clone(),
++            &poseidon_constants,
++            &poseidon_mds,
++        )?;
++        assign_authorization_relation_region(
++            &config,
++            &mut layouter,
++            "receiver_auth_relation",
++            receiver_nonce_cell,
++            receiver_challenge_cell,
++            oracle_pubkey_cell.clone(),
++            receiver_response_cell,
++        )?;
++
++        // ── Merkle root field element (same for both membership paths) ───
+         let root_val = bytes_to_field::<F>(&self.public.compliance_merkle_root);
+ 
+         // ── Region 6: Merkle path for sender (C1) ────────────────────────
+@@ -897,21 +1103,6 @@ where
+             MERKLE_ROOT_START,
+         )?;
+ 
+-        // ── Wire oracle_pubkey_hash → instance column (row 64) ───────────
+-        let oracle_hash_cell = assign_single_input_poseidon_region(
+-            &config,
+-            &mut layouter,
+-            "oracle_pubkey_hash",
+-            oracle_pubkey_cell,
+-            &poseidon_constants,
+-            &poseidon_mds,
+-        )?;
+-        layouter.constrain_instance(
+-            oracle_hash_cell.cell(),
+-            config.instance,
+-            ORACLE_PUBKEY_HASH_START,
+-        )?;
+-
+         // ── Wire block_height → instance column (row 96) ─────────────────
+         // block_height is a scalar; assign it into a throwaway advice cell
+         // just so we can record the copy-constraint.
+@@ -1144,12 +1335,22 @@ mod tests {
+             })
+     }
+ 
++    fn sign_authorization(oracle_pubkey: [u8; 32], authorized_pubkey: [u8; 32], nonce_seed: u64) -> [u8; 64] {
++        let oracle_key = bytes_to_field::<Fr>(&oracle_pubkey);
++        let oracle_hash = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey);
++        let authorized_hash = merkle_leaf_hash_from_pubkey::<Fr>(&authorized_pubkey);
++        let nonce = Fr::from(nonce_seed);
++        let challenge = oracle_authorization_challenge(oracle_hash, authorized_hash, nonce);
++        let response = nonce + challenge * oracle_key;
++        oracle_signature_bytes(nonce, response)
++    }
++
+     fn make_fixture() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
+         let sender_pubkey: [u8; 32] = [0x01u8; 32];
+         let receiver_pubkey: [u8; 32] = [0x02u8; 32];
+-        let sender_oracle_sig: [u8; 64] = [0x03u8; 64];
+-        let receiver_oracle_sig: [u8; 64] = [0x04u8; 64];
+         let oracle_pubkey: [u8; 32] = [0x05u8; 32];
++        let sender_oracle_sig = sign_authorization(oracle_pubkey, sender_pubkey, 7);
++        let receiver_oracle_sig = sign_authorization(oracle_pubkey, receiver_pubkey, 11);
+         let amount: u64 = 999;
+         let block_height: u64 = 1_000_000;
+ 
+@@ -1352,4 +1553,27 @@ mod tests {
+             "Wrong oracle pubkey should fail the oracle_pubkey_hash binding"
+         );
+     }
++
++    #[test]
++    fn test_valid_oracle_authorization_passes() {
++        let (circuit, instance) = make_fixture();
++        let prover = MockProver::<Fr>::run(10, &circuit, instance).expect("MockProver::run failed");
++        prover
++            .verify()
++            .expect("Valid Schnorr-style oracle authorization should satisfy the circuit");
++    }
++
++    #[test]
++    fn test_tampered_oracle_signature_fails() {
++        let (mut circuit, instance) = make_fixture();
++        circuit.witness = circuit.witness.map(|mut w| {
++            w.sender_oracle_sig[0] ^= 0x01;
++            w
++        });
++        let prover = MockProver::<Fr>::run(10, &circuit, instance).expect("MockProver::run failed");
++        assert!(
++            prover.verify().is_err(),
++            "Tampered sender oracle authorization should fail the circuit"
++        );
++    }
+ }
+diff --git a/crates/compliance-sidecar/Cargo.toml b/crates/compliance-sidecar/Cargo.toml
+index 7556392..d87e486 100644
+--- a/crates/compliance-sidecar/Cargo.toml
++++ b/crates/compliance-sidecar/Cargo.toml
+@@ -15,4 +15,3 @@ tokio = { version = "1", features = ["full"] }
+ clap = { version = "4", features = ["derive"] }
+ rand = "0.8"
+ rand_core = "0.6"
+-ed25519-dalek = { version = "2", features = ["rand_core"] }
+diff --git a/crates/compliance-sidecar/src/main.rs b/crates/compliance-sidecar/src/main.rs
+index 5921ad0..b44790d 100644
+--- a/crates/compliance-sidecar/src/main.rs
++++ b/crates/compliance-sidecar/src/main.rs
+@@ -227,10 +227,9 @@ mod inner {
+ 
+     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+     use compliance_circuit::{
+-        circuit::{merkle_leaf_hash_from_pubkey, PublicInputs, Witness, MERKLE_DEPTH},
++        circuit::{PublicInputs, Witness, MERKLE_DEPTH},
+         ComplianceCircuit,
+     };
+-    use ed25519_dalek::{Signature, VerifyingKey};
+     use halo2_proofs::{
+         arithmetic::Field,
+         circuit::Value,
+@@ -277,11 +276,13 @@ mod inner {
+         pub receiver_pubkey: String,
+         /// Transaction amount.
+         pub amount: u64,
+-        /// Hex-encoded oracle signature over `Poseidon(sender_pubkey)` (64 bytes).
++        /// Hex-encoded oracle authorization transcript over
++        /// `Poseidon(sender_pubkey)` as `nonce || response` (64 bytes).
+         pub sender_oracle_sig: String,
+-        /// Hex-encoded oracle signature over `Poseidon(receiver_pubkey)` (64 bytes).
++        /// Hex-encoded oracle authorization transcript over
++        /// `Poseidon(receiver_pubkey)` as `nonce || response` (64 bytes).
+         pub receiver_oracle_sig: String,
+-        /// Hex-encoded compliance oracle ed25519 public key (32 bytes).
++        /// Hex-encoded compliance oracle authorization key material (32 bytes).
+         pub oracle_pubkey: String,
+         /// Hex-encoded compliance Merkle tree root (32 bytes).
+         pub compliance_merkle_root: String,
+@@ -552,8 +553,6 @@ mod inner {
+         };
+ 
+         let req = normalize_request(req).map_err(ProverError::Error)?;
+-        validate_oracle_authorizations(&req)
+-            .map_err(ProverError::NonCompliant)?;
+ 
+         // ── Build circuit inputs ─────────────────────────────────────────
+         let public = PublicInputs {
+@@ -657,27 +656,6 @@ mod inner {
+         Ok((proof_b64, public_inputs_hex, proof_time_ms))
+     }
+ 
+-    pub(crate) fn validate_oracle_authorizations(
+-        req: &NormalizedProofRequest,
+-    ) -> Result<(), String> {
+-        let verifying_key = VerifyingKey::from_bytes(&req.oracle_pubkey)
+-            .map_err(|e| format!("invalid oracle_pubkey: {e}"))?;
+-        let sender_sig = Signature::from_bytes(&req.sender_oracle_sig);
+-        let receiver_sig = Signature::from_bytes(&req.receiver_oracle_sig);
+-
+-        let sender_msg = merkle_leaf_hash_from_pubkey::<Fr>(&req.sender_pubkey).to_repr();
+-        let receiver_msg = merkle_leaf_hash_from_pubkey::<Fr>(&req.receiver_pubkey).to_repr();
+-
+-        verifying_key
+-            .verify_strict(sender_msg.as_ref(), &sender_sig)
+-            .map_err(|e| format!("sender_oracle_sig verification failed: {e}"))?;
+-        verifying_key
+-            .verify_strict(receiver_msg.as_ref(), &receiver_sig)
+-            .map_err(|e| format!("receiver_oracle_sig verification failed: {e}"))?;
+-
+-        Ok(())
+-    }
+-
+     // ─────────────────────────────────────────────────────────────────────────
+     // Hex decode helpers
+     // ─────────────────────────────────────────────────────────────────────────
+@@ -773,13 +751,35 @@ mod inner {
+         Ok(arr)
+     }
+ 
++    fn reject_non_field_encoding(bytes: &[u8; 32], field: &str, half: &str) -> Result<(), String> {
++        if bytes[31] >= 0x30 {
++            return Err(format!(
++                "{field} {half}: value >= Fr modulus (MSB byte 0x{:02x}); \
++                 would silently collapse in field encoding — reject",
++                bytes[31]
++            ));
++        }
++
++        Ok(())
++    }
++
+     fn decode_hex_64(s: &str, field: &str) -> Result<[u8; 64], String> {
+         let bytes = hex::decode(s.trim_start_matches("0x"))
+             .map_err(|e| format!("{field}: hex decode error: {e}"))?;
+         let len = bytes.len();
+-        bytes
++        let arr: [u8; 64] = bytes
+             .try_into()
+-            .map_err(|_| format!("{field}: expected 64 bytes, got {len}"))
++            .map_err(|_| format!("{field}: expected 64 bytes, got {len}"))?;
++
++        let mut nonce = [0u8; 32];
++        nonce.copy_from_slice(&arr[..32]);
++        reject_non_field_encoding(&nonce, field, "nonce")?;
++
++        let mut response = [0u8; 32];
++        response.copy_from_slice(&arr[32..]);
++        reject_non_field_encoding(&response, field, "response")?;
++
++        Ok(arr)
+     }
+ 
+     /// Decode a hex string into 32 bytes without the modulus guard.
+@@ -829,14 +829,14 @@ mod tests {
+     use super::inner::{normalize_request, ProofRequest};
+     use compliance_circuit::{
+         circuit::{
+-            merkle_leaf_hash_from_pubkey, merkle_parent_hash_fields, tx_hash_field_from_inputs,
++            merkle_leaf_hash_from_pubkey, merkle_parent_hash_fields,
++            oracle_authorization_challenge, oracle_signature_bytes, tx_hash_field_from_inputs,
+             PublicInputs, Witness,
+             BLOCK_HEIGHT_ROW, MERKLE_DEPTH, MERKLE_ROOT_START, NUM_INSTANCE_ROWS,
+             ORACLE_PUBKEY_HASH_START, TX_HASH_START,
+         },
+         ComplianceCircuit,
+     };
+-    use ed25519_dalek::{Signer as _, SigningKey};
+     use halo2_proofs::{
+         arithmetic::Field,
+         circuit::Value,
+@@ -907,28 +907,23 @@ mod tests {
+         (siblings, directions)
+     }
+ 
+-    fn sign_poseidon_pubkey_message(signing_key: &SigningKey, pubkey: [u8; 32]) -> [u8; 64] {
+-        let msg = merkle_leaf_hash_from_pubkey::<Fr>(&pubkey).to_repr();
+-        signing_key.sign(msg.as_ref()).to_bytes()
+-    }
+-
+-    fn generate_fr_compatible_signing_key() -> SigningKey {
+-        loop {
+-            let candidate = SigningKey::generate(&mut OsRng);
+-            if candidate.verifying_key().to_bytes()[31] < 0x30 {
+-                return candidate;
+-            }
+-        }
++    fn sign_authorization(oracle_pubkey: [u8; 32], authorized_pubkey: [u8; 32], nonce_seed: u64) -> [u8; 64] {
++        let oracle_key = bytes_to_field_fr(&oracle_pubkey);
++        let oracle_hash = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey);
++        let authorized_hash = merkle_leaf_hash_from_pubkey::<Fr>(&authorized_pubkey);
++        let nonce = Fr::from(nonce_seed);
++        let challenge = oracle_authorization_challenge(oracle_hash, authorized_hash, nonce);
++        let response = nonce + challenge * oracle_key;
++        oracle_signature_bytes(nonce, response)
+     }
+ 
+     /// Build a minimal but valid circuit + instance column for k=10.
+     fn make_circuit_and_instances() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
+         let sender_pubkey = [0x01u8; 32];
+         let receiver_pubkey = [0x02u8; 32];
+-        let signing_key = generate_fr_compatible_signing_key();
+-        let oracle_pubkey = signing_key.verifying_key().to_bytes();
+-        let sender_oracle_sig = sign_poseidon_pubkey_message(&signing_key, sender_pubkey);
+-        let receiver_oracle_sig = sign_poseidon_pubkey_message(&signing_key, receiver_pubkey);
++        let oracle_pubkey = [0x05u8; 32];
++        let sender_oracle_sig = sign_authorization(oracle_pubkey, sender_pubkey, 7);
++        let receiver_oracle_sig = sign_authorization(oracle_pubkey, receiver_pubkey, 11);
+         let amount: u64 = 42;
+         let block_height: u64 = 1;
+ 
+@@ -1078,14 +1073,10 @@ mod tests {
+             bytes[0] = 0x12;
+             bytes
+         };
+-        let signing_key = generate_fr_compatible_signing_key();
+-        let oracle_pubkey = signing_key.verifying_key().to_bytes();
++        let oracle_pubkey = [0x05u8; 32];
+         let oracle_pubkey_hash = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey).to_repr();
+-        let oracle_pubkey = {
+-            oracle_pubkey
+-        };
+-        let sender_oracle_sig = sign_poseidon_pubkey_message(&signing_key, sender_pubkey);
+-        let receiver_oracle_sig = sign_poseidon_pubkey_message(&signing_key, receiver_pubkey);
++        let sender_oracle_sig = sign_authorization(oracle_pubkey, sender_pubkey, 7);
++        let receiver_oracle_sig = sign_authorization(oracle_pubkey, receiver_pubkey, 11);
+         let sender_sibling = format!("0x{}", hex::encode([0x07u8; 32]));
+         let receiver_sibling = format!("0x{}", hex::encode([0x08u8; 32]));
+         json!({
+@@ -1129,42 +1120,6 @@ mod tests {
+         assert_eq!(normalized.receiver_merkle_directions, vec![true, false, true, false]);
+     }
+ 
+-    #[test]
+-    fn test_oracle_authorization_validates_real_signatures() {
+-        let raw = valid_request_json().to_string();
+-        let req: ProofRequest = serde_json::from_str(&raw).expect("request should deserialize");
+-        let normalized = normalize_request(req).expect("request should normalize");
+-        super::inner::validate_oracle_authorizations(&normalized)
+-            .expect("valid oracle signatures should verify");
+-    }
+-
+-    #[test]
+-    fn test_oracle_authorization_rejects_tampered_signature() {
+-        let mut raw = valid_request_json();
+-        let bad_sig = {
+-            let mut bytes = hex::decode(
+-                raw["sender_oracle_sig"]
+-                    .as_str()
+-                    .expect("sender_oracle_sig string")
+-                    .trim_start_matches("0x"),
+-            )
+-            .expect("valid hex");
+-            bytes[0] ^= 0xFF;
+-            format!("0x{}", hex::encode(bytes))
+-        };
+-        raw["sender_oracle_sig"] = json!(bad_sig);
+-
+-        let req: ProofRequest =
+-            serde_json::from_str(&raw.to_string()).expect("request should deserialize");
+-        let normalized = normalize_request(req).expect("request should normalize");
+-        let err = super::inner::validate_oracle_authorizations(&normalized)
+-            .expect_err("tampered signature should fail");
+-        assert!(
+-            err.contains("sender_oracle_sig verification failed"),
+-            "unexpected error: {err}"
+-        );
+-    }
+-
+     #[test]
+     fn test_invalid_pubkey_fails_cleanly() {
+         let mut raw = valid_request_json();
+diff --git a/docs/adr/0001-schnorr-over-pasta-oracle-authorization.md b/docs/adr/0001-schnorr-over-pasta-oracle-authorization.md
+new file mode 100644
+index 0000000..f1d6f5d
+--- /dev/null
++++ b/docs/adr/0001-schnorr-over-pasta-oracle-authorization.md
+@@ -0,0 +1,46 @@
++# ADR 0001: Schnorr-Over-Pasta Oracle Authorization
++
++## Status
++
++Accepted
++
++## Context
++
++The sidecar previously carried oracle-authorization fields through the Rust request and witness boundary, but actual authorization checking still happened in a sidecar-only `ed25519-dalek` preflight path. That split the trust model in two places:
++
++- the circuit proved Merkle membership, transaction binding, and oracle-key hash binding
++- the sidecar separately enforced oracle authorization outside the proof
++
++That was acceptable as a staging step, but it is the wrong steady state. The proof system should enforce the authorization statement itself so validators only need to trust the proof plus the public `oracle_pubkey_hash`.
++
++## Decision
++
++Use a Schnorr-style authorization transcript carried in the existing Rust-side witness fields:
++
++- `oracle_pubkey`: 32-byte oracle authorization key material
++- `sender_oracle_sig`: 64-byte `nonce || response`
++- `receiver_oracle_sig`: 64-byte `nonce || response`
++
++For each authorized party, the circuit now:
++
++1. hashes the private oracle key material to the existing public `oracle_pubkey_hash`
++2. hashes the transaction party pubkey with the existing Poseidon leaf function
++3. derives a challenge as `Poseidon(oracle_pubkey_hash, authorized_pubkey_hash, nonce)`
++4. enforces the Schnorr-style response relation `response = nonce + challenge * oracle_key`
++
++This keeps the migration Rust-only:
++
++- no validator or wire-format expansion is required
++- public inputs stay unchanged
++- the sidecar and circuit crates can transition together without reopening the blocked validator/oracle-registration redesign
++
++## Replaces
++
++- Sidecar-only Ed25519 verification via `ed25519-dalek`
++- The previous prototype state where oracle signatures were present in the witness but unconstrained in-circuit
++
++## Consequences
++
++- Oracle authorization is now enforced by the proof, not by sidecar-only preflight code.
++- The sidecar no longer needs the Ed25519 dependency path.
++- The migration remains intentionally scoped to the Rust circuit/sidecar boundary; wider protocol work such as validator-managed oracle key registration or a different on-chain encoding can happen later without reintroducing split authorization logic.
+-- 
+2.43.0
+

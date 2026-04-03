@@ -116,6 +116,17 @@ circuit-friendly Schnorr-style signature scheme over a proving-system-friendly
 curve. XRPL transaction parties remain Ed25519 pubkeys; only the oracle's own
 authorization primitive changes.
 
+Current implementation status:
+
+- The Rust sidecar/circuit boundary now uses canonical compressed Pallas oracle
+  pubkeys and canonical Schnorr `(R,s)` bytes.
+- Boundary validation rejects malformed encodings, the identity point, and
+  oracle values that cannot be represented safely by the current staged BN254
+  witness path.
+- The circuit has not yet reached the final verifier shape. It still uses a
+  temporary staged scalar relation internally, and the full non-native
+  Schnorr-over-Pasta equation remains future work.
+
 ## Soundness Note
 
 The circuit is sound if the Merkle tree collision resistance holds under the

@@ -133,6 +133,16 @@ Schnorr-style signature scheme rather than Ed25519. The ZK circuit proves the
 prover holds valid oracle authorizations for both sender and receiver — without
 revealing the pubkeys, the signatures, or the Merkle paths to any verifier.
 
+Current implementation note:
+
+- ZK-15 is a sequence, not one atomic patch.
+- The Rust boundary now accepts canonical compressed Pallas oracle pubkeys and
+  canonical Schnorr `(R,s)` signatures.
+- Malformed, identity, non-canonical, and BN254-incompatible oracle encodings
+  are rejected before witness construction.
+- The current circuit still uses a staged scalar relation internally. Full
+  non-native Schnorr-over-Pasta verification remains a later phase.
+
 Merkle tree depth 20 supports up to **~1M cleared pubkeys**.
 
 ### 2.2.1 Implementation Delta (Current Rust Workspace)
@@ -531,6 +541,15 @@ path is a Schnorr-over-Pasta-style construction rather than Ed25519. That
 reduces implementation risk, avoids non-native Edwards arithmetic in the Halo2
 circuit, and is expected to materially reduce proving cost versus the earlier
 Ed25519-based draft.
+
+Implementation status for that path:
+
+- Done: sidecar-only Ed25519 authorization removal.
+- Done: canonical Rust-side parsing for oracle pubkeys and Schnorr `(R,s)`
+  inputs, plus malformed and BN254-incompatible input rejection.
+- Open: replace the staged scalar relation with the real non-native
+  Schnorr-over-Pasta verifier equation and remove the remaining byte-packing
+  prototype.
 
 Post Fiat target block time: **~1 second**. With a `PROOF_TIMEOUT_MS` of 2000 ms
 and server-class hardware, proof generation fits comfortably within the block

@@ -227,7 +227,11 @@ mod inner {
 
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use compliance_circuit::{
-        circuit::{PublicInputs, Witness, MERKLE_DEPTH},
+        circuit::{
+            canonical_oracle_pubkey_from_bytes, canonical_schnorr_signature_from_bytes,
+            merkle_leaf_hash_from_pubkey, CanonicalOraclePubkey, CanonicalSchnorrSignature,
+            PublicInputs, Witness, MERKLE_DEPTH,
+        },
         ComplianceCircuit,
     };
     use halo2_proofs::{
@@ -276,13 +280,13 @@ mod inner {
         pub receiver_pubkey: String,
         /// Transaction amount.
         pub amount: u64,
-        /// Hex-encoded oracle authorization transcript over
-        /// `Poseidon(sender_pubkey)` as `nonce || response` (64 bytes).
+        /// Hex-encoded canonical Schnorr signature over `Poseidon(sender_pubkey)`
+        /// as compressed `R` point (32 bytes) || scalar `s` (32 bytes).
         pub sender_oracle_sig: String,
-        /// Hex-encoded oracle authorization transcript over
-        /// `Poseidon(receiver_pubkey)` as `nonce || response` (64 bytes).
+        /// Hex-encoded canonical Schnorr signature over `Poseidon(receiver_pubkey)`
+        /// as compressed `R` point (32 bytes) || scalar `s` (32 bytes).
         pub receiver_oracle_sig: String,
-        /// Hex-encoded compliance oracle authorization key material (32 bytes).
+        /// Hex-encoded compressed canonical Pallas oracle public key (32 bytes).
         pub oracle_pubkey: String,
         /// Hex-encoded compliance Merkle tree root (32 bytes).
         pub compliance_merkle_root: String,
@@ -335,9 +339,9 @@ mod inner {
         pub(crate) sender_pubkey: [u8; 32],
         pub(crate) receiver_pubkey: [u8; 32],
         pub(crate) amount: u64,
-        pub(crate) sender_oracle_sig: [u8; 64],
-        pub(crate) receiver_oracle_sig: [u8; 64],
-        pub(crate) oracle_pubkey: [u8; 32],
+        pub(crate) sender_oracle_sig: CanonicalSchnorrSignature,
+        pub(crate) receiver_oracle_sig: CanonicalSchnorrSignature,
+        pub(crate) oracle_pubkey: CanonicalOraclePubkey,
         pub(crate) compliance_merkle_root: [u8; 32],
         pub(crate) oracle_pubkey_hash: [u8; 32],
         pub(crate) block_height: u64,
@@ -565,9 +569,9 @@ mod inner {
             sender_pubkey: req.sender_pubkey,
             receiver_pubkey: req.receiver_pubkey,
             amount: req.amount,
-            sender_oracle_sig: req.sender_oracle_sig,
-            receiver_oracle_sig: req.receiver_oracle_sig,
-            oracle_pubkey: req.oracle_pubkey,
+            sender_oracle_sig: req.sender_oracle_sig.to_bytes(),
+            receiver_oracle_sig: req.receiver_oracle_sig.to_bytes(),
+            oracle_pubkey: req.oracle_pubkey.to_bytes(),
             sender_merkle_siblings: req.sender_merkle_siblings,
             sender_merkle_directions: req.sender_merkle_directions,
             receiver_merkle_siblings: req.receiver_merkle_siblings,
@@ -664,12 +668,18 @@ mod inner {
         let tx_hash = decode_hex_32(&req.tx_hash, "tx_hash")?;
         let sender_pubkey = decode_hex_32(&req.sender_pubkey, "sender_pubkey")?;
         let receiver_pubkey = decode_hex_32(&req.receiver_pubkey, "receiver_pubkey")?;
-        let sender_oracle_sig = decode_hex_64(&req.sender_oracle_sig, "sender_oracle_sig")?;
-        let receiver_oracle_sig = decode_hex_64(&req.receiver_oracle_sig, "receiver_oracle_sig")?;
-        let oracle_pubkey = decode_hex_32(&req.oracle_pubkey, "oracle_pubkey")?;
+        let sender_oracle_sig = decode_oracle_signature(&req.sender_oracle_sig, "sender_oracle_sig")?;
+        let receiver_oracle_sig =
+            decode_oracle_signature(&req.receiver_oracle_sig, "receiver_oracle_sig")?;
+        let oracle_pubkey = decode_oracle_pubkey(&req.oracle_pubkey, "oracle_pubkey")?;
         let compliance_merkle_root =
             decode_hex_32(&req.compliance_merkle_root, "compliance_merkle_root")?;
         let oracle_pubkey_hash = decode_hex_32(&req.oracle_pubkey_hash, "oracle_pubkey_hash")?;
+        let expected_oracle_pubkey_hash =
+            merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey.to_bytes()).to_repr();
+        if expected_oracle_pubkey_hash.as_ref() != oracle_pubkey_hash {
+            return Err("oracle_pubkey_hash does not match canonical oracle_pubkey encoding".to_string());
+        }
 
         if req.sender_merkle_siblings.len() != MERKLE_DEPTH {
             return Err(format!(
@@ -751,35 +761,19 @@ mod inner {
         Ok(arr)
     }
 
-    fn reject_non_field_encoding(bytes: &[u8; 32], field: &str, half: &str) -> Result<(), String> {
-        if bytes[31] >= 0x30 {
-            return Err(format!(
-                "{field} {half}: value >= Fr modulus (MSB byte 0x{:02x}); \
-                 would silently collapse in field encoding — reject",
-                bytes[31]
-            ));
-        }
-
-        Ok(())
+    fn decode_oracle_pubkey(s: &str, field: &str) -> Result<CanonicalOraclePubkey, String> {
+        let bytes = decode_hex_32_unchecked(s, field)?;
+        canonical_oracle_pubkey_from_bytes(bytes)
     }
 
-    fn decode_hex_64(s: &str, field: &str) -> Result<[u8; 64], String> {
+    fn decode_oracle_signature(s: &str, field: &str) -> Result<CanonicalSchnorrSignature, String> {
         let bytes = hex::decode(s.trim_start_matches("0x"))
             .map_err(|e| format!("{field}: hex decode error: {e}"))?;
         let len = bytes.len();
         let arr: [u8; 64] = bytes
             .try_into()
             .map_err(|_| format!("{field}: expected 64 bytes, got {len}"))?;
-
-        let mut nonce = [0u8; 32];
-        nonce.copy_from_slice(&arr[..32]);
-        reject_non_field_encoding(&nonce, field, "nonce")?;
-
-        let mut response = [0u8; 32];
-        response.copy_from_slice(&arr[32..]);
-        reject_non_field_encoding(&response, field, "response")?;
-
-        Ok(arr)
+        canonical_schnorr_signature_from_bytes(arr).map_err(|e| format!("{field}: {e}"))
     }
 
     /// Decode a hex string into 32 bytes without the modulus guard.
@@ -818,6 +812,7 @@ mod inner {
             Fr::from(u64::from_le_bytes(low))
         })
     }
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -830,7 +825,7 @@ mod tests {
     use compliance_circuit::{
         circuit::{
             merkle_leaf_hash_from_pubkey, merkle_parent_hash_fields,
-            oracle_authorization_challenge, oracle_signature_bytes, tx_hash_field_from_inputs,
+            oracle_authorization_challenge, tx_hash_field_from_inputs,
             PublicInputs, Witness,
             BLOCK_HEIGHT_ROW, MERKLE_DEPTH, MERKLE_ROOT_START, NUM_INSTANCE_ROWS,
             ORACLE_PUBKEY_HASH_START, TX_HASH_START,
@@ -854,6 +849,10 @@ mod tests {
         bn256::{Bn256, Fr, G1Affine},
         ff::PrimeField,
     };
+    use pasta_curves::{
+        group::{prime::PrimeCurveAffine, Curve, Group, GroupEncoding},
+        pallas,
+    };
     use rand_core::OsRng;
     use serde_json::json;
 
@@ -867,6 +866,36 @@ mod tests {
             low.copy_from_slice(&bytes[..8.min(bytes.len())]);
             Fr::from(u64::from_le_bytes(low))
         })
+    }
+
+    fn fits_bn254_witness_encoding(bytes: [u8; 32]) -> bool {
+        Fr::from_repr(bytes.into()).into_option().is_some()
+    }
+
+    fn find_bn254_incompatible_pallas_point() -> [u8; 32] {
+        for scalar in 1u64..10_000 {
+            let encoded = (pallas::Point::generator() * pallas::Scalar::from(scalar))
+                .to_affine()
+                .to_bytes();
+            if !fits_bn254_witness_encoding(encoded) {
+                return encoded;
+            }
+        }
+
+        panic!("expected to find a Pallas point that does not fit BN254 witness encoding");
+    }
+
+    fn find_bn254_compatible_pallas_point(start_scalar: u64) -> [u8; 32] {
+        for scalar in start_scalar..start_scalar + 10_000 {
+            let encoded = (pallas::Point::generator() * pallas::Scalar::from(scalar))
+                .to_affine()
+                .to_bytes();
+            if fits_bn254_witness_encoding(encoded) {
+                return encoded;
+            }
+        }
+
+        panic!("expected to find a Pallas point that fits BN254 witness encoding");
     }
 
     fn field_to_bytes(f: Fr) -> [u8; 32] {
@@ -907,21 +936,30 @@ mod tests {
         (siblings, directions)
     }
 
-    fn sign_authorization(oracle_pubkey: [u8; 32], authorized_pubkey: [u8; 32], nonce_seed: u64) -> [u8; 64] {
+    fn sign_authorization(
+        oracle_pubkey: [u8; 32],
+        authorized_pubkey: [u8; 32],
+        nonce_seed: u64,
+    ) -> [u8; 64] {
+        let encoded_r = find_bn254_compatible_pallas_point(nonce_seed);
+        let encoded_r_field = bytes_to_field_fr(&encoded_r);
         let oracle_key = bytes_to_field_fr(&oracle_pubkey);
         let oracle_hash = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey);
         let authorized_hash = merkle_leaf_hash_from_pubkey::<Fr>(&authorized_pubkey);
-        let nonce = Fr::from(nonce_seed);
-        let challenge = oracle_authorization_challenge(oracle_hash, authorized_hash, nonce);
-        let response = nonce + challenge * oracle_key;
-        oracle_signature_bytes(nonce, response)
+        let challenge = oracle_authorization_challenge(oracle_hash, authorized_hash, encoded_r_field);
+        let response = encoded_r_field + challenge * oracle_key;
+
+        let mut encoded = [0u8; 64];
+        encoded[..32].copy_from_slice(&encoded_r);
+        encoded[32..].copy_from_slice(response.to_repr().as_ref());
+        encoded
     }
 
     /// Build a minimal but valid circuit + instance column for k=10.
     fn make_circuit_and_instances() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
         let sender_pubkey = [0x01u8; 32];
         let receiver_pubkey = [0x02u8; 32];
-        let oracle_pubkey = [0x05u8; 32];
+        let oracle_pubkey = find_bn254_compatible_pallas_point(17);
         let sender_oracle_sig = sign_authorization(oracle_pubkey, sender_pubkey, 7);
         let receiver_oracle_sig = sign_authorization(oracle_pubkey, receiver_pubkey, 11);
         let amount: u64 = 42;
@@ -1073,7 +1111,7 @@ mod tests {
             bytes[0] = 0x12;
             bytes
         };
-        let oracle_pubkey = [0x05u8; 32];
+        let oracle_pubkey = find_bn254_compatible_pallas_point(17);
         let oracle_pubkey_hash = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey).to_repr();
         let sender_oracle_sig = sign_authorization(oracle_pubkey, sender_pubkey, 7);
         let receiver_oracle_sig = sign_authorization(oracle_pubkey, receiver_pubkey, 11);
@@ -1110,14 +1148,139 @@ mod tests {
         expected_receiver[0] = 0x23;
         assert_eq!(normalized.sender_pubkey, expected_sender);
         assert_eq!(normalized.receiver_pubkey, expected_receiver);
-        assert_ne!(normalized.sender_oracle_sig, [0u8; 64]);
-        assert_ne!(normalized.receiver_oracle_sig, [0u8; 64]);
-        let mut expected_oracle = [0u8; 32];
-        expected_oracle.copy_from_slice(&normalized.oracle_pubkey);
-        assert_eq!(normalized.oracle_pubkey, expected_oracle);
+        assert_ne!(normalized.sender_oracle_sig.to_bytes(), [0u8; 64]);
+        assert_ne!(normalized.receiver_oracle_sig.to_bytes(), [0u8; 64]);
+        let expected_oracle = find_bn254_compatible_pallas_point(17);
+        assert_eq!(normalized.oracle_pubkey.to_bytes(), expected_oracle);
         assert_eq!(normalized.sender_merkle_siblings.len(), MERKLE_DEPTH);
         assert_eq!(normalized.sender_merkle_directions, vec![false, true, false, true]);
         assert_eq!(normalized.receiver_merkle_directions, vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn test_invalid_oracle_pubkey_encoding_rejected() {
+        let mut raw = valid_request_json();
+        raw["oracle_pubkey"] = json!(format!("0x{}", hex::encode([0xFFu8; 32])));
+
+        let req: ProofRequest =
+            serde_json::from_str(&raw.to_string()).expect("schema should still deserialize");
+        let err = normalize_request(req).expect_err("bad oracle pubkey should fail");
+        assert!(
+            err.contains("oracle_pubkey: invalid compressed Pallas point encoding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_identity_oracle_pubkey_rejected() {
+        let mut raw = valid_request_json();
+        let identity = pallas::Affine::identity().to_bytes();
+        raw["oracle_pubkey"] = json!(format!("0x{}", hex::encode(identity)));
+
+        let req: ProofRequest =
+            serde_json::from_str(&raw.to_string()).expect("schema should still deserialize");
+        let err = normalize_request(req).expect_err("identity oracle pubkey should fail");
+        assert!(
+            err.contains("oracle_pubkey: identity point is not allowed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_bn254_incompatible_oracle_pubkey_rejected() {
+        let mut raw = valid_request_json();
+        raw["oracle_pubkey"] = json!(format!(
+            "0x{}",
+            hex::encode(find_bn254_incompatible_pallas_point())
+        ));
+
+        let req: ProofRequest =
+            serde_json::from_str(&raw.to_string()).expect("schema should still deserialize");
+        let err = normalize_request(req).expect_err("BN254-incompatible oracle pubkey should fail");
+        assert!(
+            err.contains("oracle_pubkey: compressed Pallas public key does not fit the current BN254 witness encoding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_signature_r_encoding_rejected() {
+        let mut raw = valid_request_json();
+        let mut sig = hex::decode(
+            raw["sender_oracle_sig"]
+                .as_str()
+                .expect("sender_oracle_sig string")
+                .trim_start_matches("0x"),
+        )
+        .expect("valid hex");
+        sig[..32].copy_from_slice(&[0xFFu8; 32]);
+        raw["sender_oracle_sig"] = json!(format!("0x{}", hex::encode(sig)));
+
+        let req: ProofRequest =
+            serde_json::from_str(&raw.to_string()).expect("schema should still deserialize");
+        let err = normalize_request(req).expect_err("bad R encoding should fail");
+        assert!(
+            err.contains("sender_oracle_sig: R: invalid compressed Pallas point encoding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_non_canonical_signature_scalar_rejected() {
+        let mut raw = valid_request_json();
+        let mut sig = hex::decode(
+            raw["receiver_oracle_sig"]
+                .as_str()
+                .expect("receiver_oracle_sig string")
+                .trim_start_matches("0x"),
+        )
+        .expect("valid hex");
+        sig[63] = 0xFF;
+        raw["receiver_oracle_sig"] = json!(format!("0x{}", hex::encode(sig)));
+
+        let req: ProofRequest =
+            serde_json::from_str(&raw.to_string()).expect("schema should still deserialize");
+        let err = normalize_request(req).expect_err("non-canonical scalar should fail");
+        assert!(
+            err.contains("receiver_oracle_sig: s: non-canonical Pallas scalar encoding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_bn254_incompatible_signature_r_rejected() {
+        let mut raw = valid_request_json();
+        let mut sig = hex::decode(
+            raw["receiver_oracle_sig"]
+                .as_str()
+                .expect("receiver_oracle_sig string")
+                .trim_start_matches("0x"),
+        )
+        .expect("valid hex");
+        sig[..32].copy_from_slice(&find_bn254_incompatible_pallas_point());
+        raw["receiver_oracle_sig"] = json!(format!("0x{}", hex::encode(sig)));
+
+        let req: ProofRequest =
+            serde_json::from_str(&raw.to_string()).expect("schema should still deserialize");
+        let err = normalize_request(req).expect_err("BN254-incompatible R point should fail");
+        assert!(
+            err.contains("receiver_oracle_sig: R: compressed Pallas point does not fit the current BN254 witness encoding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_oracle_pubkey_hash_mismatch_rejected() {
+        let mut raw = valid_request_json();
+        raw["oracle_pubkey_hash"] = json!(format!("0x{}", hex::encode([0x24u8; 32])));
+
+        let req: ProofRequest =
+            serde_json::from_str(&raw.to_string()).expect("schema should still deserialize");
+        let err = normalize_request(req).expect_err("mismatched oracle hash should fail");
+        assert!(
+            err.contains("oracle_pubkey_hash does not match canonical oracle_pubkey encoding"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

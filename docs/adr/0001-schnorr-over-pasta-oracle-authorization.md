@@ -15,13 +15,14 @@ That was acceptable as a staging step, but it is the wrong steady state. The pro
 
 ## Decision
 
-Use a Schnorr-style authorization transcript carried in the existing Rust-side witness fields:
+Use a staged Schnorr-style authorization migration carried in the existing
+Rust-side witness fields:
 
 - `oracle_pubkey`: 32-byte oracle authorization key material
 - `sender_oracle_sig`: 64-byte `nonce || response`
 - `receiver_oracle_sig`: 64-byte `nonce || response`
 
-For each authorized party, the circuit now:
+For each authorized party, the current staged circuit now:
 
 1. hashes the private oracle key material to the existing public `oracle_pubkey_hash`
 2. hashes the transaction party pubkey with the existing Poseidon leaf function
@@ -34,6 +35,16 @@ This keeps the migration Rust-only:
 - public inputs stay unchanged
 - the sidecar and circuit crates can transition together without reopening the blocked validator/oracle-registration redesign
 
+The migration is intentionally split into phases:
+
+1. remove the sidecar-only Ed25519 path
+2. harden the Rust witness boundary with canonical compressed Pallas pubkeys and
+   canonical Schnorr `(R,s)` parsing
+3. replace the temporary scalar relation with the full non-native
+   Schnorr-over-Pasta verifier equation inside the circuit
+
+Only the first two phases are complete today.
+
 ## Replaces
 
 - Sidecar-only Ed25519 verification via `ed25519-dalek`
@@ -43,4 +54,9 @@ This keeps the migration Rust-only:
 
 - Oracle authorization is now enforced by the proof, not by sidecar-only preflight code.
 - The sidecar no longer needs the Ed25519 dependency path.
-- The migration remains intentionally scoped to the Rust circuit/sidecar boundary; wider protocol work such as validator-managed oracle key registration or a different on-chain encoding can happen later without reintroducing split authorization logic.
+- The migration remains intentionally scoped to the Rust circuit/sidecar
+  boundary; wider protocol work such as validator-managed oracle key
+  registration or a different on-chain encoding can happen later without
+  reintroducing split authorization logic.
+- The current implementation is still a staged verifier path, not the final
+  non-native Schnorr-over-Pasta arithmetic design.
