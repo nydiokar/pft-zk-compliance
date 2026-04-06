@@ -45,6 +45,13 @@ The migration is intentionally split into phases:
 
 Only the first two phases are complete today.
 
+For ZK-15c-style reference tracing, the repo may additionally pin test-only
+equation vectors that reuse the current canonical Rust witness encoding
+(`oracle_pubkey_hash`, `Poseidon(pubkey)` message bytes, and canonical `R`
+bytes) while the final Schnorr challenge transcript is still being specified.
+Those vectors are audit fixtures for the later non-native gate patch, not yet a
+protocol-level transcript commitment.
+
 ## Replaces
 
 - Sidecar-only Ed25519 verification via `ed25519-dalek`

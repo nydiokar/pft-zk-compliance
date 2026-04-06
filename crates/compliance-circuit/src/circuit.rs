@@ -1353,11 +1353,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ff::{Field, PrimeField};
+    use ff::{Field, FromUniformBytes, PrimeField};
     use group::Group;
     use halo2_proofs::{circuit::Value, dev::MockProver};
     use halo2curves::bn256::Fr;
-    use pasta_curves::group::Curve;
+    use pasta_curves::{
+        group::{Curve, GroupEncoding},
+        pallas,
+    };
+    use sha2::{Digest, Sha256};
 
     #[derive(Clone, Debug)]
     struct AmountRangeTestCircuit {
@@ -1484,6 +1488,146 @@ mod tests {
         encoded
     }
 
+    #[derive(Clone, Debug)]
+    struct SchnorrEquationTrace {
+        message_bytes: [u8; 32],
+        encoded_pubkey: [u8; 32],
+        encoded_r: [u8; 32],
+        encoded_s: [u8; 32],
+        challenge_scalar: pallas::Scalar,
+        lhs_bytes: [u8; 32],
+        rhs_bytes: [u8; 32],
+    }
+
+    impl SchnorrEquationTrace {
+        fn equation_holds(&self) -> bool {
+            self.lhs_bytes == self.rhs_bytes
+        }
+    }
+
+    fn authorization_message_bytes(authorized_pubkey: [u8; 32]) -> [u8; 32] {
+        merkle_leaf_hash_from_pubkey::<Fr>(&authorized_pubkey).to_repr().into()
+    }
+
+    fn authorization_oracle_pubkey_hash_bytes(oracle_pubkey: [u8; 32]) -> [u8; 32] {
+        merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey).to_repr().into()
+    }
+
+    /// Temporary adapter from the current staged authorization transcript
+    /// bytes into a Pasta scalar challenge for audit traces.
+    ///
+    /// This intentionally reuses the current canonical Rust encoding inputs:
+    /// `oracle_pubkey_hash`, `Poseidon(pubkey)` message bytes, and compressed
+    /// `R`. The final non-native verifier patch should replace this adapter
+    /// only after the Schnorr transcript is explicitly specified.
+    fn schnorr_challenge_scalar_from_current_encoding(
+        oracle_pubkey_hash_bytes: [u8; 32],
+        encoded_r: [u8; 32],
+        message_bytes: [u8; 32],
+    ) -> pallas::Scalar {
+        let mut preimage = Vec::with_capacity(32 * 3 + 28);
+        preimage.extend_from_slice(b"pft-zk-compliance:zk15c:challenge");
+        preimage.extend_from_slice(&oracle_pubkey_hash_bytes);
+        preimage.extend_from_slice(&encoded_r);
+        preimage.extend_from_slice(&message_bytes);
+
+        let mut block0 = preimage.clone();
+        block0.push(0);
+        let digest0 = Sha256::digest(block0);
+
+        let mut block1 = preimage;
+        block1.push(1);
+        let digest1 = Sha256::digest(block1);
+
+        let mut wide_bytes = [0u8; 64];
+        wide_bytes[..32].copy_from_slice(&digest0);
+        wide_bytes[32..].copy_from_slice(&digest1);
+        pallas::Scalar::from_uniform_bytes(&wide_bytes)
+    }
+
+    fn trace_schnorr_equation(
+        oracle_pubkey: [u8; 32],
+        signature: [u8; 64],
+        message_bytes: [u8; 32],
+    ) -> SchnorrEquationTrace {
+        let public_key = parse_canonical_pallas_point(oracle_pubkey, "oracle_pubkey")
+            .expect("reference trace requires canonical oracle pubkey bytes");
+        let signature = canonical_schnorr_signature_from_bytes(signature)
+            .expect("reference trace requires canonical Schnorr signature bytes");
+        let encoded_r = signature.r_bytes();
+        let encoded_s = signature.s_bytes();
+        let r_point =
+            parse_canonical_pallas_point(encoded_r, "R").expect("signature R should stay canonical");
+        let s_scalar = parse_canonical_pallas_scalar(encoded_s, "s")
+            .expect("signature s should stay canonical");
+        let oracle_pubkey_hash_bytes = authorization_oracle_pubkey_hash_bytes(oracle_pubkey);
+        let challenge = schnorr_challenge_scalar_from_current_encoding(
+            oracle_pubkey_hash_bytes,
+            encoded_r,
+            message_bytes,
+        );
+
+        let lhs = (pallas::Point::generator() * s_scalar).to_affine();
+        let rhs = (pallas::Point::from(r_point) + (pallas::Point::from(public_key) * challenge))
+            .to_affine();
+
+        SchnorrEquationTrace {
+            message_bytes,
+            encoded_pubkey: oracle_pubkey,
+            encoded_r,
+            encoded_s,
+            challenge_scalar: challenge,
+            lhs_bytes: lhs.to_bytes(),
+            rhs_bytes: rhs.to_bytes(),
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct AuthorizationVector {
+        sender_pubkey: [u8; 32],
+        oracle_pubkey: [u8; 32],
+        signature: [u8; 64],
+        message_bytes: [u8; 32],
+    }
+
+    const ZK15C_REFERENCE_ORACLE_PUBKEY_HEX: &str =
+        "badd5cdf47e39611a21e3526e80cbb9394a5926a48b824103fa85469fb3b4218";
+    const ZK15C_REFERENCE_SIGNATURE_HEX: &str =
+        "f96bd719329a1a817d9e010f103dfd699b0a3026c819400da04061d929fdbf01180746f4b979d52c1e022605ff59ac06173d6b3d14367761b6e1e27e403cf10f";
+    const ZK15C_REFERENCE_MESSAGE_BYTES_HEX: &str =
+        "f0502835e5a787a3e37eafb84008c62412da623a82591778f9a3d202f9da530b";
+
+    fn decode_hex_array<const N: usize>(hex_str: &str) -> [u8; N] {
+        let decoded = hex::decode(hex_str).expect("reference hex fixture should decode");
+        decoded
+            .try_into()
+            .unwrap_or_else(|_| panic!("expected {N} decoded bytes in reference fixture"))
+    }
+
+    fn zk15c_reference_authorization_vector() -> AuthorizationVector {
+        let sender_pubkey = [0x01u8; 32];
+        let oracle_pubkey = decode_hex_array(ZK15C_REFERENCE_ORACLE_PUBKEY_HEX);
+        let signature = decode_hex_array(ZK15C_REFERENCE_SIGNATURE_HEX);
+        let message_bytes = decode_hex_array(ZK15C_REFERENCE_MESSAGE_BYTES_HEX);
+
+        AuthorizationVector {
+            sender_pubkey,
+            oracle_pubkey,
+            signature,
+            message_bytes,
+        }
+    }
+
+    fn zk15c_tampered_authorization_vector() -> AuthorizationVector {
+        let mut vector = zk15c_reference_authorization_vector();
+        vector.signature[32] ^= 0x01;
+        vector
+    }
+
+    const BASELINE_MIN_K_SEARCH_START: u32 = 8;
+    const BASELINE_MIN_K_SEARCH_END: u32 = 12;
+    const BASELINE_MAX_ALLOWED_K: u32 = 10;
+
     fn make_fixture() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
         let sender_pubkey: [u8; 32] = [0x01u8; 32];
         let receiver_pubkey: [u8; 32] = [0x02u8; 32];
@@ -1563,6 +1707,42 @@ mod tests {
         instance_col[BLOCK_HEIGHT_ROW] = Fr::from(block_height);
 
         (circuit, vec![instance_col])
+    }
+
+    fn zk15c_baseline_fixture() -> (ComplianceCircuit, Vec<Vec<Fr>>) {
+        make_fixture()
+    }
+
+    fn find_minimum_passing_k(
+        circuit: &ComplianceCircuit,
+        instance: &[Vec<Fr>],
+    ) -> Result<u32, String> {
+        for k in BASELINE_MIN_K_SEARCH_START..=BASELINE_MIN_K_SEARCH_END {
+            let prover = match MockProver::<Fr>::run(k, circuit, instance.to_vec()) {
+                Ok(prover) => prover,
+                Err(ErrorFront::NotEnoughRowsAvailable { .. }) => continue,
+                Err(ErrorFront::AssignError(err))
+                    if err.to_string().contains("usable_rows=") && err.to_string().contains(", k=") =>
+                {
+                    continue
+                }
+                Err(err) => return Err(format!("MockProver::run failed at k={k}: {err}")),
+            };
+            if prover.verify().is_ok() {
+                return Ok(k);
+            }
+        }
+
+        Err(format!(
+            "no passing k found in range {BASELINE_MIN_K_SEARCH_START}..={BASELINE_MIN_K_SEARCH_END}"
+        ))
+    }
+
+    fn tamper_sender_authorization_signature(circuit: &mut ComplianceCircuit) {
+        circuit.witness = circuit.witness.clone().map(|mut witness| {
+            witness.sender_oracle_sig[0] ^= 0x01;
+            witness
+        });
     }
 
     #[test]
@@ -1705,14 +1885,93 @@ mod tests {
     #[test]
     fn test_tampered_oracle_signature_fails() {
         let (mut circuit, instance) = make_fixture();
-        circuit.witness = circuit.witness.map(|mut w| {
-            w.sender_oracle_sig[0] ^= 0x01;
-            w
-        });
+        tamper_sender_authorization_signature(&mut circuit);
         let prover = MockProver::<Fr>::run(10, &circuit, instance).expect("MockProver::run failed");
         assert!(
             prover.verify().is_err(),
             "Tampered sender oracle authorization should fail the circuit"
+        );
+    }
+
+    #[test]
+    fn zk15c_baseline_min_k_stays_within_bound() {
+        let (circuit, instance) = zk15c_baseline_fixture();
+        let min_k = find_minimum_passing_k(&circuit, &instance)
+            .expect("baseline fixture should pass within the configured k search range");
+        println!(
+            "baseline fixture minimum passing k: {min_k} (bound: <= {BASELINE_MAX_ALLOWED_K})"
+        );
+        assert!(
+            min_k <= BASELINE_MAX_ALLOWED_K,
+            "baseline fixture minimum passing k regressed above bound: {min_k} > {BASELINE_MAX_ALLOWED_K}"
+        );
+    }
+
+    #[test]
+    fn zk15c_baseline_tampered_authorization_rejects() {
+        let (baseline_circuit, instance) = zk15c_baseline_fixture();
+        let min_k = find_minimum_passing_k(&baseline_circuit, &instance)
+            .expect("baseline fixture should pass within the configured k search range");
+        println!("zk15c tampered-authorization check uses baseline minimum k: {min_k}");
+
+        let mut circuit = baseline_circuit;
+        tamper_sender_authorization_signature(&mut circuit);
+        let prover =
+            MockProver::<Fr>::run(min_k, &circuit, instance).expect("MockProver::run failed");
+        assert!(
+            prover.verify().is_err(),
+            "tampered oracle authorization must fail at the first k where the baseline circuit fits"
+        );
+    }
+
+    #[test]
+    fn zk15c_reference_schnorr_equation_trace_matches_for_valid_vector() {
+        let vector = zk15c_reference_authorization_vector();
+        let trace = trace_schnorr_equation(vector.oracle_pubkey, vector.signature, vector.message_bytes);
+        let expected_s: [u8; 32] = vector.signature[32..].try_into().expect("signature scalar bytes");
+
+        assert_eq!(
+            trace.message_bytes, vector.message_bytes,
+            "reference trace must preserve the current authorization message bytes"
+        );
+        assert_eq!(
+            trace.encoded_pubkey, vector.oracle_pubkey,
+            "reference trace must preserve the canonical oracle pubkey encoding"
+        );
+        assert_eq!(
+            authorization_message_bytes(vector.sender_pubkey),
+            vector.message_bytes,
+            "reference vector should keep the existing signed-message bytes"
+        );
+        assert_ne!(
+            trace.challenge_scalar,
+            pallas::Scalar::ZERO,
+            "challenge scalar should be non-zero for the representative valid vector"
+        );
+        assert_eq!(
+            trace.encoded_s, expected_s,
+            "trace should expose the canonical s encoding for later gate comparisons"
+        );
+        assert!(trace.equation_holds(), "valid reference vector must satisfy s*G = R + e*P");
+    }
+
+    #[test]
+    fn zk15c_reference_schnorr_equation_trace_breaks_for_tampered_vector() {
+        let vector = zk15c_tampered_authorization_vector();
+        let trace = trace_schnorr_equation(vector.oracle_pubkey, vector.signature, vector.message_bytes);
+        let expected_r: [u8; 32] = vector.signature[..32].try_into().expect("signature R bytes");
+
+        assert!(
+            !trace.equation_holds(),
+            "tampering the canonical witness bytes must break the Schnorr equation trace"
+        );
+        assert_ne!(
+            trace.lhs_bytes, trace.rhs_bytes,
+            "trace should expose distinct equation sides for the tampered vector"
+        );
+        assert_eq!(
+            trace.encoded_r, expected_r,
+            "tampered vector should keep the same R encoding so only the response changes"
         );
     }
 }

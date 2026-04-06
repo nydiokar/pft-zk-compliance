@@ -206,8 +206,10 @@ dependencies = [
  "halo2_poseidon",
  "halo2_proofs",
  "halo2curves",
+ "hex",
  "pasta_curves",
  "rand",
+ "sha2",
 ]
 
 [[package]]

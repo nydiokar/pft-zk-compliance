@@ -856,6 +856,13 @@ mod tests {
     use rand_core::OsRng;
     use serde_json::json;
 
+    const ZK15C_REFERENCE_ORACLE_PUBKEY_HEX: &str =
+        "badd5cdf47e39611a21e3526e80cbb9394a5926a48b824103fa85469fb3b4218";
+    const ZK15C_REFERENCE_SIGNATURE_HEX: &str =
+        "f96bd719329a1a817d9e010f103dfd699b0a3026c819400da04061d929fdbf01180746f4b979d52c1e022605ff59ac06173d6b3d14367761b6e1e27e403cf10f";
+    const ZK15C_REFERENCE_MESSAGE_BYTES_HEX: &str =
+        "f0502835e5a787a3e37eafb84008c62412da623a82591778f9a3d202f9da530b";
+
     fn bytes_to_field_fr(bytes: &[u8]) -> Fr {
         let mut repr = <Fr as PrimeField>::Repr::default();
         let s = repr.as_mut();
@@ -1136,6 +1143,49 @@ mod tests {
         })
     }
 
+    fn zk15c_reference_request_json() -> serde_json::Value {
+        let sender_pubkey = [0x01u8; 32];
+        let receiver_pubkey = [0x02u8; 32];
+        let amount: u64 = 999;
+        let block_height: u64 = 1_000_000;
+        let sender_sibling = format!("0x{}", hex::encode([0x07u8; 32]));
+        let receiver_sibling = format!("0x{}", hex::encode([0x08u8; 32]));
+        let oracle_pubkey = hex::decode(ZK15C_REFERENCE_ORACLE_PUBKEY_HEX)
+            .expect("reference oracle pubkey should decode");
+        let oracle_pubkey_hash = merkle_leaf_hash_from_pubkey::<Fr>(
+            &oracle_pubkey
+                .as_slice()
+                .try_into()
+                .expect("reference oracle pubkey length"),
+        )
+        .to_repr();
+
+        json!({
+            "version": 1,
+            "tx_hash": format!("0x{}", hex::encode(tx_hash_field_from_inputs::<Fr>(&sender_pubkey, &receiver_pubkey, amount).to_repr())),
+            "sender_pubkey": format!("0x{}", hex::encode(sender_pubkey)),
+            "receiver_pubkey": format!("0x{}", hex::encode(receiver_pubkey)),
+            "amount": amount,
+            "sender_oracle_sig": format!("0x{}", ZK15C_REFERENCE_SIGNATURE_HEX),
+            "receiver_oracle_sig": format!("0x{}", hex::encode(sign_authorization(
+                oracle_pubkey
+                    .as_slice()
+                    .try_into()
+                    .expect("reference oracle pubkey length"),
+                receiver_pubkey,
+                11
+            ))),
+            "oracle_pubkey": format!("0x{}", ZK15C_REFERENCE_ORACLE_PUBKEY_HEX),
+            "compliance_merkle_root": format!("0x{}", hex::encode([0x12u8; 32])),
+            "oracle_pubkey_hash": format!("0x{}", hex::encode(oracle_pubkey_hash)),
+            "block_height": block_height,
+            "sender_merkle_siblings": vec![sender_sibling; MERKLE_DEPTH],
+            "sender_merkle_directions": vec![false; MERKLE_DEPTH],
+            "receiver_merkle_siblings": vec![receiver_sibling; MERKLE_DEPTH],
+            "receiver_merkle_directions": vec![true; MERKLE_DEPTH],
+        })
+    }
+
     #[test]
     fn test_v1_request_deserializes_and_normalizes() {
         let raw = valid_request_json().to_string();
@@ -1155,6 +1205,44 @@ mod tests {
         assert_eq!(normalized.sender_merkle_siblings.len(), MERKLE_DEPTH);
         assert_eq!(normalized.sender_merkle_directions, vec![false, true, false, true]);
         assert_eq!(normalized.receiver_merkle_directions, vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn zk15c_reference_vector_survives_request_normalization() {
+        let raw = zk15c_reference_request_json().to_string();
+        let req: ProofRequest = serde_json::from_str(&raw).expect("reference request should deserialize");
+        let normalized = normalize_request(req).expect("reference request should normalize");
+        let expected_message_bytes =
+            hex::decode(ZK15C_REFERENCE_MESSAGE_BYTES_HEX).expect("reference message bytes should decode");
+        let expected_signature =
+            hex::decode(ZK15C_REFERENCE_SIGNATURE_HEX).expect("reference signature should decode");
+        let expected_oracle_pubkey = hex::decode(ZK15C_REFERENCE_ORACLE_PUBKEY_HEX)
+            .expect("reference oracle pubkey should decode");
+
+        assert_eq!(
+            normalized.oracle_pubkey.to_bytes().as_slice(),
+            expected_oracle_pubkey.as_slice(),
+            "normalization must preserve the fixed canonical oracle pubkey bytes"
+        );
+        assert_eq!(
+            normalized.sender_oracle_sig.to_bytes().as_slice(),
+            expected_signature.as_slice(),
+            "normalization must preserve the fixed canonical Schnorr witness bytes"
+        );
+        assert_eq!(
+            merkle_leaf_hash_from_pubkey::<Fr>(&normalized.sender_pubkey)
+                .to_repr()
+                .as_ref(),
+            expected_message_bytes.as_slice(),
+            "reference request must derive the same current authorization message bytes after normalization"
+        );
+        assert_eq!(
+            merkle_leaf_hash_from_pubkey::<Fr>(&normalized.oracle_pubkey.to_bytes())
+                .to_repr()
+                .as_ref(),
+            normalized.oracle_pubkey_hash.as_slice(),
+            "reference request must keep the current canonical oracle_pubkey_hash binding"
+        );
     }
 
     #[test]

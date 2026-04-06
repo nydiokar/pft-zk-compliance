@@ -12,4 +12,6 @@ halo2curves = "0.7"
 pasta_curves = "0.5"
 
 [dev-dependencies]
+hex = "0.4"
 rand = "0.8"
+sha2 = "0.10"

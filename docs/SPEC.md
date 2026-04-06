@@ -142,6 +142,10 @@ Current implementation note:
   are rejected before witness construction.
 - The current circuit still uses a staged scalar relation internally. Full
   non-native Schnorr-over-Pasta verification remains a later phase.
+- Test-only ZK-15c equation vectors may reuse the current canonical Rust
+  encoding (`oracle_pubkey_hash`, `Poseidon(pubkey)` bytes, canonical `R`)
+  before the final Schnorr challenge transcript is frozen. Treat those as
+  audit fixtures for implementation work, not protocol-final transcript rules.
 
 Merkle tree depth 20 supports up to **~1M cleared pubkeys**.
 
