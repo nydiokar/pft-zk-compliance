@@ -1,20 +1,19 @@
 # pf-zk-compliance — Project Context
 
-**Branch:** `master`  **Last Updated:** 2026-04-06  **Status:** Real proof generation done — `create_proof` + Blake2b transcript, pk/params loaded at startup; ZK-14 lookup-backed u64 range check complete; Halo2 git dependency pinned across the sidecar build graph with documented upgrade steps; staged in-circuit oracle authorization landed with the sidecar-only Ed25519 path removed; Rust-side canonical Pallas pubkey and Schnorr `(R,s)` boundary guards reject malformed and BN254-incompatible encodings before witness generation; ZK-15c reference equation traces now pin fixed valid/tampered Schnorr-over-Pasta vectors to the current canonical Rust witness encoding and the sidecar normalization path
+**Branch:** `master`  **Last Updated:** 2026-04-07  **Status:** Real proof generation done — `create_proof` + Blake2b transcript, pk/params loaded at startup; ZK-14 lookup-backed u64 range check complete; Halo2 git dependency pinned across the sidecar build graph with documented upgrade steps; staged in-circuit oracle authorization landed with the sidecar-only Ed25519 path removed; Rust-side canonical Pallas pubkey and Schnorr `(R,s)` boundary guards reject malformed and BN254-incompatible encodings before witness generation; ZK-15c reference equation traces pin fixed valid/tampered Schnorr-over-Pasta vectors to the canonical Rust witness/request encoding; ZK-15d now freezes the production Rust-side Schnorr transcript, verifier statement, and witness interpretation for the later non-native gate patch
 
 ---
 
 next tasks:
 
-The next work should stop preparing and start committing protocol choices.
+The next work should stop preparing and start implementing the frozen contract.
 
-  1. Freeze the final Schnorr-over-Pasta verifier transcript and statement, then implement the real non-native
-     authorization equation in-circuit against the fixed ZK-15c reference vectors. The important unresolved design
-     choice is no longer witness shape; it is the exact challenge transcript and verifier relation the production
-     circuit will enforce.
+  1. Implement the real non-native authorization equation in-circuit against the now-frozen ZK-15d Schnorr contract
+     and the fixed ZK-15c reference vectors. The important unresolved design choice is no longer transcript shape; it
+     is actual non-native Pallas arithmetic inside the circuit.
   2. Once that verifier is in, remove the staged scalar relation and only then start removing the remaining
      byte-packing prototype (`bytes_to_field`) where it materially blocks the final verifier path. Doing byte/limb work
-     before the verifier statement is frozen risks more churn.
+     before the real verifier lands still risks churn.
   3. After the real verifier lands, move from prototype sizing to production sizing. The Merkle path logic is now on
      the right shape after ZK-13, but `MERKLE_DEPTH` is still 4 with a comment saying production should be 20 in
      `crates/compliance-circuit/src/circuit.rs`. That likely means benchmark work, larger-fixture tests, and
@@ -43,7 +42,7 @@ The next work should stop preparing and start committing protocol choices.
 | ✅ | **[ZK-12] Poseidon hash gates** | L | C3 transaction binding now uses Poseidon over `[sender_pubkey, receiver_pubkey, amount]` in the Rust circuit. Public-input wiring stays at the folded `TX_HASH_START` field element. Added focused tests for valid witnesses, tampered public `tx_hash`, and tampered witness `amount`. Full `cargo test` passes. |
 | ✅ | **[ZK-13] Binary Merkle chip** | L | Sender/receiver membership now use fixed-depth binary Poseidon paths to the shared compliance root, with per-level sibling + direction-bit witnesses. Merkle leaves are `Poseidon(pubkey)` to match the spec. Focused pass/fail tests and the sidecar's real proof/verify test both pass. |
 | ✅ | **[ZK-14] Lookup table range check** | S | The tautological placeholder is gone. `amount` is now decomposed into eight 8-bit limbs, each constrained by a shared lookup table and recomposed back into the same witness value used by the Poseidon tx hash gate. Added pass/fail tests for valid u64 and non-u64 field values. |
-| [ ] | **[ZK-15] In-circuit oracle authorization** | L | The staged Rust-side migration is now in place: `oracle_pubkey` is parsed as a canonical compressed Pallas point, `sender_oracle_sig` / `receiver_oracle_sig` are parsed as canonical `(R,s)` bytes, malformed / identity / BN254-incompatible encodings are rejected before witness construction, the old sidecar-only Ed25519 path is gone, and ZK-15c reference traces now pin fixed valid/tampered equation vectors through both the circuit and sidecar normalization path. Remaining work is the protocol-final Schnorr transcript decision and the real non-native verifier equation inside the circuit, replacing the temporary scalar relation. |
+| [ ] | **[ZK-15] In-circuit oracle authorization** | L | The staged Rust-side migration is now in place: `oracle_pubkey` is parsed as a canonical compressed Pallas point, `sender_oracle_sig` / `receiver_oracle_sig` are parsed as canonical `(R,s)` bytes, malformed / identity / BN254-incompatible encodings are rejected before witness construction, the old sidecar-only Ed25519 path is gone, ZK-15c reference traces pin fixed valid/tampered equation vectors through both the circuit and sidecar normalization path, and ZK-15d freezes the production Rust-side Schnorr transcript and verifier statement. Remaining work is the actual non-native verifier equation inside the circuit, replacing the temporary scalar relation. |
 | [ ] | **[ZK-16] postfiatd IPC hook** | L | C++ side of the socket interface in postfiatd. Calls sidecar before forwarding tx to RPCA consensus. Depends on ZK-9/10/11 being stable. **When implementing: add `tokio::sync::Semaphore` in `ProverState` to cap concurrent `spawn_blocking` proof jobs — each proof is ~100-300 MB at k=8, unbounded concurrency under burst load causes OOM. Limit should be a `--max-concurrent-proofs` CLI flag sized against real circuit memory at production k.** Integration target remains the Post Fiat `postfiatd` validator daemon described in `docs/SPEC.md`. |
 | ✅ | **[ZK-17] Pin halo2 git dep** | S | `halo2_proofs` now pins `privacy-scaling-explorations/halo2` to `198e9ae30d322cd0ad003b6955f91ec095b1490d` in both `crates/compliance-sidecar` and `crates/compliance-circuit`. Added `DEPENDENCY_PINS.md`, refreshed local `Cargo.lock`, and verified with `cargo test -p compliance-sidecar --locked`. |
 
@@ -57,9 +56,10 @@ ZK-15 is a sequence, not one atomic patch.
 |:------|:------:|:--------|
 | `ZK-15a` Remove split-trust path | ✅ | The sidecar-only Ed25519 authorization path is gone. Authorization now lives on the proof side of the boundary. |
 | `ZK-15b` Canonical Rust boundary | ✅ | Oracle pubkeys are parsed as canonical compressed Pallas points; signatures are parsed as canonical `(R,s)` bytes; malformed, identity, and BN254-incompatible encodings are rejected before witness construction. |
-| `ZK-15c` Reference equation vectors | ✅ | Fixed valid/tampered Schnorr-over-Pasta equation traces are now pinned to the current canonical Rust witness encoding, and the sidecar normalization path is checked against the same vector bytes. This is an audit fixture phase, not the final protocol transcript commitment. |
-| `ZK-15d` Freeze transcript + real verifier equation | [ ] | Choose and document the final Schnorr challenge transcript and verifier statement, then replace the staged scalar relation with the real non-native Schnorr-over-Pasta verification equation in the circuit. |
-| `ZK-15e` Remove byte-packing leftovers | [ ] | After the real verifier is chosen, move oracle material and eventually wider circuit I/O toward byte/limb-based witness handling instead of the current `bytes_to_field` staging path. |
+| `ZK-15c` Reference equation vectors | ✅ | Fixed valid/tampered Schnorr-over-Pasta equation traces are now pinned to the canonical Rust witness/request encoding, and the sidecar normalization path is checked against the same vector bytes. |
+| `ZK-15d` Freeze transcript + verifier statement | ✅ | The production Rust-side Schnorr transcript is now fixed as `HashToScalar(domain || oracle_pubkey || R || m)` with `m = little_endian_repr(Poseidon(pubkey))`, and the later non-native gate patch now has a fixed verifier target `s·G = R + e·P`. |
+| `ZK-15e` Implement non-native verifier equation | [ ] | Replace the staged scalar relation with the real non-native Schnorr-over-Pasta verification equation in the circuit. |
+| `ZK-15f` Remove byte-packing leftovers | [ ] | After the real verifier lands, move oracle material and eventually wider circuit I/O toward byte/limb-based witness handling instead of the current `bytes_to_field` staging path. |
 
 ---
 
@@ -100,6 +100,7 @@ ZK-15 is a sequence, not one atomic patch.
 | `crates/compliance-circuit/src/circuit.rs` | Full ComplianceCircuit: configure, synthesize, 4 MockProver tests |
 | `crates/compliance-sidecar/src/main.rs` | CLI (serve / keygen), Unix socket listener, real `create_proof` dispatch |
 | `.ai/DEVLOG.md` | Chronological session narrative — decisions, API gotchas, lineage detail |
+| `.ai/HANDOFF.md` | Operating memo for the next LLM: mindset, architectural guardrails, secondary-sweep standards, and what to treat as the real next step |
 
 ---
 
@@ -114,10 +115,11 @@ ZK-15 is a sequence, not one atomic patch.
 - **[ZK-13 done]** Merkle membership now uses two fixed-depth binary Poseidon paths, one for sender and one for receiver, converging to the shared public `compliance_merkle_root`. Merkle leaves are `Poseidon(pubkey)`, matching `docs/SPEC.md` and `docs/circuit_io.md`.
 - **[ZK-14 done]** `amount` is now range-checked as a true u64 via an 8-bit lookup table plus linear recomposition. The same copied advice cell feeds both the range-check region and the C3 Poseidon binding, so the prover cannot swap in a different amount across regions.
 - **[ZK-15 partial]** The circuit now enforces a staged in-circuit authorization relation and the sidecar no longer performs native Ed25519 verification before proving. The remaining gap is replacing that temporary scalar relation with the real non-native Schnorr-over-Pasta equation.
-- **[ZK-15c done]** The repo now has fixed valid/tampered Schnorr-over-Pasta equation-trace fixtures in the circuit crate, tied to the current canonical Rust encoding (`oracle_pubkey_hash`, `Poseidon(pubkey)` bytes, canonical `R`) and checked through sidecar request normalization. These vectors are intentionally audit fixtures for the later non-native verifier patch, not a final transcript freeze.
+- **[ZK-15c done]** The repo now has fixed valid/tampered Schnorr-over-Pasta equation-trace fixtures in the circuit crate, tied to the canonical Rust witness/request encoding and checked through sidecar request normalization.
 - **[boundary hardening done]** Oracle pubkeys are now parsed as canonical compressed Pallas points, signatures as canonical `(R,s)` bytes, and the sidecar rejects malformed, identity, and BN254-incompatible encodings before witness construction. This makes the current staged circuit path auditable instead of silently collapsing incompatible bytes.
-- **[open, highest priority]** The protocol-final Schnorr challenge transcript is still not frozen. That is now the main decision blocking the real non-native verifier implementation; further “bridge” work should be resisted unless it directly serves that patch.
-- **[open]** The current `bytes_to_field` prototype still reduces 32-byte values into one BN254 field element inside the circuit. The new boundary guards ensure oracle material only enters that path when the encoding is exactly representable in BN254 `Fr`, but the production byte/limb-based witness encoding work should follow, not precede, the final verifier statement.
+- **[ZK-15d done]** The production Rust-side Schnorr contract is now frozen: canonical `oracle_pubkey` bytes, canonical signature `(R,s)` interpretation, message bytes `little_endian_repr(Poseidon(pubkey))`, transcript domain `pft-zk-compliance:oracle-schnorr:v1`, `HashToScalar(SHA256(x||0) || SHA256(x||1))`, and verifier target `s·G = R + e·P`.
+- **[open, highest priority]** The next oracle-auth task should be the actual non-native verifier implementation. Further bridge work should be resisted unless it directly helps land that circuit patch.
+- **[open]** The current `bytes_to_field` prototype still reduces 32-byte values into one BN254 field element inside the circuit. The new boundary guards ensure oracle material only enters that path when the encoding is exactly representable in BN254 `Fr`, but the production byte/limb-based witness encoding work should follow the real verifier patch, not replace it.
 - **[open, by design]** Instance column wires one folded field element per public input. Production circuit would wire all 32 individual byte cells to match the full `[u8; 32]` layout in `docs/circuit_io.md`.
 - **[open]** `postfiatd` is C++ (rippled fork). No C++ changes are needed until ZK-16 (IPC hook).
 - **[platform]** Unix socket listener is Linux-only (`cfg(unix)`). Build/type-check on Windows with `cargo check --target x86_64-unknown-linux-gnu -p compliance-sidecar`.

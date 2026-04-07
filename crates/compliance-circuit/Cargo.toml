@@ -10,8 +10,8 @@ group = "0.13"
 halo2_poseidon = "0.1.0"
 halo2curves = "0.7"
 pasta_curves = "0.5"
+sha2 = "0.10"
 
 [dev-dependencies]
 hex = "0.4"
 rand = "0.8"
-sha2 = "0.10"

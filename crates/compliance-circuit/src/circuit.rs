@@ -75,6 +75,7 @@ use halo2curves::bn256::Fr as Bn254Fr;
 use group::{ff::PrimeField, prime::PrimeCurveAffine, GroupEncoding};
 use group::ff::FromUniformBytes;
 use pasta_curves::pallas;
+use sha2::{Digest, Sha256};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -107,6 +108,8 @@ const TX_POSEIDON_TOTAL_ROUNDS: usize =
 const RANGE_LIMB_BITS: usize = 8;
 const RANGE_LIMB_BASE: u64 = 1 << RANGE_LIMB_BITS;
 const RANGE_LIMB_COUNT: usize = 8;
+pub const ORACLE_AUTHORIZATION_SCHNORR_DOMAIN: &[u8] =
+    b"pft-zk-compliance:oracle-schnorr:v1";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public / private input types
@@ -619,11 +622,64 @@ where
     poseidon_hash_words([left, right])
 }
 
-pub fn oracle_authorization_challenge<F>(oracle_pubkey_hash: F, authorized_key_hash: F, nonce: F) -> F
+pub fn oracle_authorization_staged_challenge<F>(
+    oracle_pubkey_hash: F,
+    authorized_key_hash: F,
+    nonce: F,
+) -> F
 where
     F: ff::PrimeField + FromUniformBytes<64> + Ord,
 {
     poseidon_hash_words([oracle_pubkey_hash, authorized_key_hash, nonce])
+}
+
+pub fn oracle_authorization_message_bytes(authorized_pubkey: &[u8; 32]) -> [u8; 32] {
+    merkle_leaf_hash_from_pubkey::<Bn254Fr>(authorized_pubkey)
+        .to_repr()
+        .into()
+}
+
+pub fn oracle_authorization_challenge_scalar(
+    oracle_pubkey: &[u8; 32],
+    encoded_r: &[u8; 32],
+    message_bytes: &[u8; 32],
+) -> pallas::Scalar {
+    let mut preimage = Vec::with_capacity(
+        ORACLE_AUTHORIZATION_SCHNORR_DOMAIN.len() + oracle_pubkey.len() + encoded_r.len() + message_bytes.len(),
+    );
+    preimage.extend_from_slice(ORACLE_AUTHORIZATION_SCHNORR_DOMAIN);
+    preimage.extend_from_slice(oracle_pubkey);
+    preimage.extend_from_slice(encoded_r);
+    preimage.extend_from_slice(message_bytes);
+
+    let mut block0 = preimage.clone();
+    block0.push(0);
+    let digest0 = Sha256::digest(block0);
+
+    let mut block1 = preimage;
+    block1.push(1);
+    let digest1 = Sha256::digest(block1);
+
+    let mut wide_bytes = [0u8; 64];
+    wide_bytes[..32].copy_from_slice(&digest0);
+    wide_bytes[32..].copy_from_slice(&digest1);
+    pallas::Scalar::from_uniform_bytes(&wide_bytes)
+}
+
+pub fn oracle_authorization_challenge_scalar_from_witness(
+    oracle_pubkey: &[u8; 32],
+    signature: &[u8; 64],
+    authorized_pubkey: &[u8; 32],
+) -> Result<pallas::Scalar, String> {
+    canonical_oracle_pubkey_from_bytes(*oracle_pubkey)?;
+    let signature = canonical_schnorr_signature_from_bytes(*signature)?;
+    let encoded_r = signature.r_bytes();
+    let message_bytes = oracle_authorization_message_bytes(authorized_pubkey);
+    Ok(oracle_authorization_challenge_scalar(
+        oracle_pubkey,
+        &encoded_r,
+        &message_bytes,
+    ))
 }
 
 pub fn oracle_signature_fields_from_bytes<F>(signature: &[u8; 64]) -> (F, F)
@@ -1353,7 +1409,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ff::{Field, FromUniformBytes, PrimeField};
+    use ff::{Field, PrimeField};
     use group::Group;
     use halo2_proofs::{circuit::Value, dev::MockProver};
     use halo2curves::bn256::Fr;
@@ -1361,7 +1417,6 @@ mod tests {
         group::{Curve, GroupEncoding},
         pallas,
     };
-    use sha2::{Digest, Sha256};
 
     #[derive(Clone, Debug)]
     struct AmountRangeTestCircuit {
@@ -1478,8 +1533,11 @@ mod tests {
         let oracle_key = bytes_to_field::<Fr>(&oracle_pubkey);
         let oracle_hash = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey);
         let authorized_hash = merkle_leaf_hash_from_pubkey::<Fr>(&authorized_pubkey);
-        let challenge =
-            oracle_authorization_challenge(oracle_hash, authorized_hash, encoded_r_field);
+        let challenge = oracle_authorization_staged_challenge(
+            oracle_hash,
+            authorized_hash,
+            encoded_r_field,
+        );
         let response = encoded_r_field + challenge * oracle_key;
 
         let mut encoded = [0u8; 64];
@@ -1505,46 +1563,6 @@ mod tests {
         }
     }
 
-    fn authorization_message_bytes(authorized_pubkey: [u8; 32]) -> [u8; 32] {
-        merkle_leaf_hash_from_pubkey::<Fr>(&authorized_pubkey).to_repr().into()
-    }
-
-    fn authorization_oracle_pubkey_hash_bytes(oracle_pubkey: [u8; 32]) -> [u8; 32] {
-        merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey).to_repr().into()
-    }
-
-    /// Temporary adapter from the current staged authorization transcript
-    /// bytes into a Pasta scalar challenge for audit traces.
-    ///
-    /// This intentionally reuses the current canonical Rust encoding inputs:
-    /// `oracle_pubkey_hash`, `Poseidon(pubkey)` message bytes, and compressed
-    /// `R`. The final non-native verifier patch should replace this adapter
-    /// only after the Schnorr transcript is explicitly specified.
-    fn schnorr_challenge_scalar_from_current_encoding(
-        oracle_pubkey_hash_bytes: [u8; 32],
-        encoded_r: [u8; 32],
-        message_bytes: [u8; 32],
-    ) -> pallas::Scalar {
-        let mut preimage = Vec::with_capacity(32 * 3 + 28);
-        preimage.extend_from_slice(b"pft-zk-compliance:zk15c:challenge");
-        preimage.extend_from_slice(&oracle_pubkey_hash_bytes);
-        preimage.extend_from_slice(&encoded_r);
-        preimage.extend_from_slice(&message_bytes);
-
-        let mut block0 = preimage.clone();
-        block0.push(0);
-        let digest0 = Sha256::digest(block0);
-
-        let mut block1 = preimage;
-        block1.push(1);
-        let digest1 = Sha256::digest(block1);
-
-        let mut wide_bytes = [0u8; 64];
-        wide_bytes[..32].copy_from_slice(&digest0);
-        wide_bytes[32..].copy_from_slice(&digest1);
-        pallas::Scalar::from_uniform_bytes(&wide_bytes)
-    }
-
     fn trace_schnorr_equation(
         oracle_pubkey: [u8; 32],
         signature: [u8; 64],
@@ -1560,11 +1578,10 @@ mod tests {
             parse_canonical_pallas_point(encoded_r, "R").expect("signature R should stay canonical");
         let s_scalar = parse_canonical_pallas_scalar(encoded_s, "s")
             .expect("signature s should stay canonical");
-        let oracle_pubkey_hash_bytes = authorization_oracle_pubkey_hash_bytes(oracle_pubkey);
-        let challenge = schnorr_challenge_scalar_from_current_encoding(
-            oracle_pubkey_hash_bytes,
-            encoded_r,
-            message_bytes,
+        let challenge = oracle_authorization_challenge_scalar(
+            &oracle_pubkey,
+            &encoded_r,
+            &message_bytes,
         );
 
         let lhs = (pallas::Point::generator() * s_scalar).to_affine();
@@ -1593,7 +1610,7 @@ mod tests {
     const ZK15C_REFERENCE_ORACLE_PUBKEY_HEX: &str =
         "badd5cdf47e39611a21e3526e80cbb9394a5926a48b824103fa85469fb3b4218";
     const ZK15C_REFERENCE_SIGNATURE_HEX: &str =
-        "f96bd719329a1a817d9e010f103dfd699b0a3026c819400da04061d929fdbf01180746f4b979d52c1e022605ff59ac06173d6b3d14367761b6e1e27e403cf10f";
+        "f96bd719329a1a817d9e010f103dfd699b0a3026c819400da04061d929fdbf01df5b73d6a737a615f6a52da918efa8e0293a5477bf0e47e851d54fb9e6576917";
     const ZK15C_REFERENCE_MESSAGE_BYTES_HEX: &str =
         "f0502835e5a787a3e37eafb84008c62412da623a82591778f9a3d202f9da530b";
 
@@ -1925,7 +1942,7 @@ mod tests {
     }
 
     #[test]
-    fn zk15c_reference_schnorr_equation_trace_matches_for_valid_vector() {
+    fn zk15d_final_transcript_valid_vector_matches_equation() {
         let vector = zk15c_reference_authorization_vector();
         let trace = trace_schnorr_equation(vector.oracle_pubkey, vector.signature, vector.message_bytes);
         let expected_s: [u8; 32] = vector.signature[32..].try_into().expect("signature scalar bytes");
@@ -1939,7 +1956,7 @@ mod tests {
             "reference trace must preserve the canonical oracle pubkey encoding"
         );
         assert_eq!(
-            authorization_message_bytes(vector.sender_pubkey),
+            oracle_authorization_message_bytes(&vector.sender_pubkey),
             vector.message_bytes,
             "reference vector should keep the existing signed-message bytes"
         );
@@ -1956,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn zk15c_reference_schnorr_equation_trace_breaks_for_tampered_vector() {
+    fn zk15d_final_transcript_tampered_vector_breaks_equation() {
         let vector = zk15c_tampered_authorization_vector();
         let trace = trace_schnorr_equation(vector.oracle_pubkey, vector.signature, vector.message_bytes);
         let expected_r: [u8; 32] = vector.signature[..32].try_into().expect("signature R bytes");

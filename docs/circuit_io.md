@@ -60,6 +60,15 @@ SchnorrVerify(
 ) = 1
 ```
 
+Witness interpretation for the frozen Rust-side contract:
+
+- `P = DecodePallasPoint(oracle_pubkey)`
+- `R = DecodePallasPoint(sender_oracle_sig[0..32])`
+- `s = DecodePallasScalar(sender_oracle_sig[32..64])`
+- `m = little_endian_repr(Poseidon(sender_pubkey))`
+- `e = HashToScalar("pft-zk-compliance:oracle-schnorr:v1" || oracle_pubkey || sender_oracle_sig[0..32] || m)`
+- enforce `s·G = R + e·P`
+
 ### C2: Receiver oracle authorization
 ```
 SchnorrVerify(
@@ -68,6 +77,9 @@ SchnorrVerify(
     sig = receiver_oracle_sig
 ) = 1
 ```
+
+Receiver authorization uses the same transcript and verifier statement with
+`receiver_pubkey` and `receiver_oracle_sig`.
 
 ### C3: Sender membership
 ```
@@ -123,6 +135,8 @@ Current implementation status:
 - Boundary validation rejects malformed encodings, the identity point, and
   oracle values that cannot be represented safely by the current staged BN254
   witness path.
+- The production Rust-side Schnorr transcript is now frozen so later non-native
+  gates have a fixed contract to target.
 - The circuit has not yet reached the final verifier shape. It still uses a
   temporary staged scalar relation internally, and the full non-native
   Schnorr-over-Pasta equation remains future work.

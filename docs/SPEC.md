@@ -140,12 +140,18 @@ Current implementation note:
   canonical Schnorr `(R,s)` signatures.
 - Malformed, identity, non-canonical, and BN254-incompatible oracle encodings
   are rejected before witness construction.
+- The production Schnorr transcript is now frozen at the Rust boundary:
+  `e = HashToScalar(domain || oracle_pubkey || R || m)` where
+  `domain = "pft-zk-compliance:oracle-schnorr:v1"`,
+  `m = little_endian_repr(Poseidon(pubkey))` in `Bn254Fr`, and
+  `HashToScalar(x) = pallas::Scalar::from_uniform_bytes(SHA256(x || 0) || SHA256(x || 1))`.
+- The production verifier statement to implement non-natively is
+  `s·G = R + e·P`, with `P` and `R` interpreted as canonical non-identity
+  compressed Pallas points and `s` interpreted as a canonical Pallas scalar.
 - The current circuit still uses a staged scalar relation internally. Full
   non-native Schnorr-over-Pasta verification remains a later phase.
-- Test-only ZK-15c equation vectors may reuse the current canonical Rust
-  encoding (`oracle_pubkey_hash`, `Poseidon(pubkey)` bytes, canonical `R`)
-  before the final Schnorr challenge transcript is frozen. Treat those as
-  audit fixtures for implementation work, not protocol-final transcript rules.
+- Fixed ZK-15c equation vectors now target that frozen Rust-side contract and
+  serve as the audit baseline for the later non-native gate patch.
 
 Merkle tree depth 20 supports up to **~1M cleared pubkeys**.
 
@@ -184,6 +190,15 @@ SchnorrVerify(
 ) = 1
 ```
 
+With witness interpretation:
+
+- `P = DecodePallasPoint(oracle_pubkey)`
+- `R = DecodePallasPoint(sender_oracle_sig[0..32])`
+- `s = DecodePallasScalar(sender_oracle_sig[32..64])`
+- `m = little_endian_repr(Poseidon(sender_pubkey))`
+- `e = HashToScalar("pft-zk-compliance:oracle-schnorr:v1" || oracle_pubkey || sender_oracle_sig[0..32] || m)`
+- enforce `s·G = R + e·P`
+
 **C2 — Receiver oracle authorization valid:**
 ```
 SchnorrVerify(
@@ -192,6 +207,10 @@ SchnorrVerify(
     sig = receiver_oracle_sig
 ) = 1
 ```
+
+With the same transcript and witness interpretation, replacing
+`sender_pubkey` / `sender_oracle_sig` with `receiver_pubkey` /
+`receiver_oracle_sig`.
 
 **C3 — Sender pubkey present in compliance Merkle tree:**
 ```
@@ -551,9 +570,11 @@ Implementation status for that path:
 - Done: sidecar-only Ed25519 authorization removal.
 - Done: canonical Rust-side parsing for oracle pubkeys and Schnorr `(R,s)`
   inputs, plus malformed and BN254-incompatible input rejection.
+- Done: freeze the production Rust-side Schnorr transcript and verifier
+  statement for the later non-native gate patch.
 - Open: replace the staged scalar relation with the real non-native
-  Schnorr-over-Pasta verifier equation and remove the remaining byte-packing
-  prototype.
+  Schnorr-over-Pasta verifier equation and, after that, remove the remaining
+  byte-packing prototype.
 
 Post Fiat target block time: **~1 second**. With a `PROOF_TIMEOUT_MS` of 2000 ms
 and server-class hardware, proof generation fits comfortably within the block

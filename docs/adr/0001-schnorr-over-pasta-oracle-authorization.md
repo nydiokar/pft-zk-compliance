@@ -22,7 +22,8 @@ Rust-side witness fields:
 - `sender_oracle_sig`: 64-byte `nonce || response`
 - `receiver_oracle_sig`: 64-byte `nonce || response`
 
-For each authorized party, the current staged circuit now:
+For each authorized party, the current staged circuit still uses this temporary
+relation:
 
 1. hashes the private oracle key material to the existing public `oracle_pubkey_hash`
 2. hashes the transaction party pubkey with the existing Poseidon leaf function
@@ -45,12 +46,23 @@ The migration is intentionally split into phases:
 
 Only the first two phases are complete today.
 
-For ZK-15c-style reference tracing, the repo may additionally pin test-only
-equation vectors that reuse the current canonical Rust witness encoding
-(`oracle_pubkey_hash`, `Poseidon(pubkey)` message bytes, and canonical `R`
-bytes) while the final Schnorr challenge transcript is still being specified.
-Those vectors are audit fixtures for the later non-native gate patch, not yet a
-protocol-level transcript commitment.
+The production Schnorr contract for the later non-native verifier patch is now
+frozen at the Rust boundary:
+
+- witness public key `P`: canonical compressed Pallas `oracle_pubkey` bytes
+- witness nonce point `R`: canonical compressed Pallas `R` bytes from the
+  first 32 bytes of `sender_oracle_sig` / `receiver_oracle_sig`
+- witness response scalar `s`: canonical Pallas scalar bytes from the final
+  32 bytes of the signature
+- message bytes `m`: the little-endian 32-byte `Bn254Fr` representation of
+  `Poseidon(pubkey)` using the current canonical Rust encoding helper
+- challenge scalar `e`: `HashToScalar(domain || P || R || m)` where
+  `domain = "pft-zk-compliance:oracle-schnorr:v1"` and `HashToScalar` means
+  `pallas::Scalar::from_uniform_bytes(SHA256(x || 0) || SHA256(x || 1))`
+- verifier equation: `s·G = R + e·P`
+
+`oracle_pubkey_hash` remains a separate circuit binding to the active oracle
+key. It is not part of the final Schnorr transcript.
 
 ## Replaces
 

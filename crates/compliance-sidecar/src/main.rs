@@ -825,7 +825,8 @@ mod tests {
     use compliance_circuit::{
         circuit::{
             merkle_leaf_hash_from_pubkey, merkle_parent_hash_fields,
-            oracle_authorization_challenge, tx_hash_field_from_inputs,
+            oracle_authorization_challenge_scalar_from_witness,
+            oracle_authorization_message_bytes, tx_hash_field_from_inputs,
             PublicInputs, Witness,
             BLOCK_HEIGHT_ROW, MERKLE_DEPTH, MERKLE_ROOT_START, NUM_INSTANCE_ROWS,
             ORACLE_PUBKEY_HASH_START, TX_HASH_START,
@@ -859,7 +860,7 @@ mod tests {
     const ZK15C_REFERENCE_ORACLE_PUBKEY_HEX: &str =
         "badd5cdf47e39611a21e3526e80cbb9394a5926a48b824103fa85469fb3b4218";
     const ZK15C_REFERENCE_SIGNATURE_HEX: &str =
-        "f96bd719329a1a817d9e010f103dfd699b0a3026c819400da04061d929fdbf01180746f4b979d52c1e022605ff59ac06173d6b3d14367761b6e1e27e403cf10f";
+        "f96bd719329a1a817d9e010f103dfd699b0a3026c819400da04061d929fdbf01df5b73d6a737a615f6a52da918efa8e0293a5477bf0e47e851d54fb9e6576917";
     const ZK15C_REFERENCE_MESSAGE_BYTES_HEX: &str =
         "f0502835e5a787a3e37eafb84008c62412da623a82591778f9a3d202f9da530b";
 
@@ -953,7 +954,11 @@ mod tests {
         let oracle_key = bytes_to_field_fr(&oracle_pubkey);
         let oracle_hash = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey);
         let authorized_hash = merkle_leaf_hash_from_pubkey::<Fr>(&authorized_pubkey);
-        let challenge = oracle_authorization_challenge(oracle_hash, authorized_hash, encoded_r_field);
+        let challenge = compliance_circuit::circuit::oracle_authorization_staged_challenge(
+            oracle_hash,
+            authorized_hash,
+            encoded_r_field,
+        );
         let response = encoded_r_field + challenge * oracle_key;
 
         let mut encoded = [0u8; 64];
@@ -1208,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn zk15c_reference_vector_survives_request_normalization() {
+    fn zk15d_final_transcript_survives_request_normalization() {
         let raw = zk15c_reference_request_json().to_string();
         let req: ProofRequest = serde_json::from_str(&raw).expect("reference request should deserialize");
         let normalized = normalize_request(req).expect("reference request should normalize");
@@ -1230,9 +1235,7 @@ mod tests {
             "normalization must preserve the fixed canonical Schnorr witness bytes"
         );
         assert_eq!(
-            merkle_leaf_hash_from_pubkey::<Fr>(&normalized.sender_pubkey)
-                .to_repr()
-                .as_ref(),
+            oracle_authorization_message_bytes(&normalized.sender_pubkey).as_slice(),
             expected_message_bytes.as_slice(),
             "reference request must derive the same current authorization message bytes after normalization"
         );
@@ -1242,6 +1245,26 @@ mod tests {
                 .as_ref(),
             normalized.oracle_pubkey_hash.as_slice(),
             "reference request must keep the current canonical oracle_pubkey_hash binding"
+        );
+        assert!(
+            oracle_authorization_challenge_scalar_from_witness(
+                &normalized.oracle_pubkey.to_bytes(),
+                &normalized.sender_oracle_sig.to_bytes(),
+                &normalized.sender_pubkey,
+            )
+            .map(|challenge| {
+                let encoded_r: [u8; 32] = normalized.sender_oracle_sig.to_bytes()[..32]
+                    .try_into()
+                    .expect("sender signature R bytes");
+                challenge
+                    == compliance_circuit::circuit::oracle_authorization_challenge_scalar(
+                        &normalized.oracle_pubkey.to_bytes(),
+                        &encoded_r,
+                        &oracle_authorization_message_bytes(&normalized.sender_pubkey),
+                    )
+            })
+            .unwrap_or(false),
+            "reference request must derive the finalized Schnorr challenge from canonical normalized witness bytes"
         );
     }
 
