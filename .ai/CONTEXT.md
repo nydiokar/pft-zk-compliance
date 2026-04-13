@@ -4,6 +4,35 @@
 
 ---
 
+## Project Aim
+
+This repo is building the Rust/Halo2 ZK compliance layer for the Post Fiat
+validator stack. Its purpose is to let a validator prove that a transaction is
+compliance-approved without revealing the sender pubkey, receiver pubkey,
+transaction amount, oracle signatures, or Merkle membership paths.
+
+The target system is a sidecar process used by `postfiatd`: the validator daemon
+sends transaction/witness material over IPC, the sidecar generates a Halo2 proof,
+and validators verify that proof before allowing compliant transactions to
+proceed toward consensus. Non-compliant or timed-out transactions enter the
+quarantine/rejection flow described in `docs/SPEC.md`.
+
+The circuit's steady-state proof statement is:
+
+1. the sender pubkey has a valid compliance-oracle authorization,
+2. the receiver pubkey has a valid compliance-oracle authorization,
+3. both pubkeys are members of the same compliance Merkle set,
+4. the private sender, receiver, and amount bind to the public `tx_hash`, and
+5. the proof is anchored to a public `compliance_merkle_root`,
+   `oracle_pubkey_hash`, and `block_height`.
+
+This ZK layer complements Post Fiat's existing LLM-based OFAC/compliance
+screening; it is not a replacement for that screening. The major unfinished
+technical goal is replacing the staged oracle-authorization relation with the
+real in-circuit non-native Schnorr-over-Pasta verifier equation `s·G = R + e·P`.
+
+---
+
 next tasks:
 
 The next work should stop preparing and start implementing the frozen contract.
