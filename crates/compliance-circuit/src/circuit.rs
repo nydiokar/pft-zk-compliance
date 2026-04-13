@@ -56,6 +56,9 @@
 //! verifies that the advice values match the supplied instance vector, so a
 //! wrong public input causes `verify()` to return `Err(...)`.
 
+use group::ff::FromUniformBytes;
+use group::{ff::PrimeField, prime::PrimeCurveAffine, GroupEncoding};
+use halo2_poseidon::{generate_constants, ConstantLength, Hash as PoseidonHash, Mds, Spec};
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
@@ -64,16 +67,8 @@ use halo2_proofs::{
     },
     poly::Rotation,
 };
-use halo2_poseidon::{
-    generate_constants,
-    ConstantLength,
-    Hash as PoseidonHash,
-    Mds,
-    Spec,
-};
 use halo2curves::bn256::Fr as Bn254Fr;
-use group::{ff::PrimeField, prime::PrimeCurveAffine, GroupEncoding};
-use group::ff::FromUniformBytes;
+use pasta_curves::arithmetic::CurveAffine as PastaCurveAffine;
 use pasta_curves::pallas;
 use sha2::{Digest, Sha256};
 
@@ -103,13 +98,13 @@ const TX_POSEIDON_WIDTH: usize = 4;
 const TX_POSEIDON_RATE: usize = 3;
 const TX_POSEIDON_FULL_ROUNDS: usize = 8;
 const TX_POSEIDON_PARTIAL_ROUNDS: usize = 56;
-const TX_POSEIDON_TOTAL_ROUNDS: usize =
-    TX_POSEIDON_FULL_ROUNDS + TX_POSEIDON_PARTIAL_ROUNDS;
+const TX_POSEIDON_TOTAL_ROUNDS: usize = TX_POSEIDON_FULL_ROUNDS + TX_POSEIDON_PARTIAL_ROUNDS;
 const RANGE_LIMB_BITS: usize = 8;
 const RANGE_LIMB_BASE: u64 = 1 << RANGE_LIMB_BITS;
 const RANGE_LIMB_COUNT: usize = 8;
-pub const ORACLE_AUTHORIZATION_SCHNORR_DOMAIN: &[u8] =
-    b"pft-zk-compliance:oracle-schnorr:v1";
+pub const NON_NATIVE_LIMB_BITS: usize = 64;
+pub const NON_NATIVE_LIMB_COUNT: usize = 4;
+pub const ORACLE_AUTHORIZATION_SCHNORR_DOMAIN: &[u8] = b"pft-zk-compliance:oracle-schnorr:v1";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public / private input types
@@ -210,7 +205,10 @@ impl CanonicalSchnorrSignature {
             "canonical Pallas scalar does not fit the current BN254 witness encoding",
         )?;
 
-        Ok(Self { encoded_r, encoded_s })
+        Ok(Self {
+            encoded_r,
+            encoded_s,
+        })
     }
 
     pub fn to_bytes(&self) -> [u8; 64] {
@@ -518,18 +516,16 @@ fn parse_canonical_pallas_scalar(bytes: [u8; 32], label: &str) -> Result<pallas:
         .ok_or_else(|| format!("{label}: non-canonical Pallas scalar encoding"))
 }
 
-fn require_bn254_field_encoding(
-    bytes: &[u8; 32],
-    label: &str,
-    reason: &str,
-) -> Result<(), String> {
+fn require_bn254_field_encoding(bytes: &[u8; 32], label: &str, reason: &str) -> Result<(), String> {
     Bn254Fr::from_repr((*bytes).into())
         .into_option()
         .map(|_| ())
         .ok_or_else(|| format!("{label}: {reason}"))
 }
 
-pub fn canonical_oracle_pubkey_from_bytes(bytes: [u8; 32]) -> Result<CanonicalOraclePubkey, String> {
+pub fn canonical_oracle_pubkey_from_bytes(
+    bytes: [u8; 32],
+) -> Result<CanonicalOraclePubkey, String> {
     CanonicalOraclePubkey::from_bytes(bytes)
 }
 
@@ -562,7 +558,11 @@ where
         0
     }
 
-    fn constants() -> (Vec<[F; TX_POSEIDON_WIDTH]>, Mds<F, TX_POSEIDON_WIDTH>, Mds<F, TX_POSEIDON_WIDTH>) {
+    fn constants() -> (
+        Vec<[F; TX_POSEIDON_WIDTH]>,
+        Mds<F, TX_POSEIDON_WIDTH>,
+        Mds<F, TX_POSEIDON_WIDTH>,
+    ) {
         generate_constants::<_, Self, TX_POSEIDON_WIDTH, TX_POSEIDON_RATE>()
     }
 }
@@ -645,7 +645,10 @@ pub fn oracle_authorization_challenge_scalar(
     message_bytes: &[u8; 32],
 ) -> pallas::Scalar {
     let mut preimage = Vec::with_capacity(
-        ORACLE_AUTHORIZATION_SCHNORR_DOMAIN.len() + oracle_pubkey.len() + encoded_r.len() + message_bytes.len(),
+        ORACLE_AUTHORIZATION_SCHNORR_DOMAIN.len()
+            + oracle_pubkey.len()
+            + encoded_r.len()
+            + message_bytes.len(),
     );
     preimage.extend_from_slice(ORACLE_AUTHORIZATION_SCHNORR_DOMAIN);
     preimage.extend_from_slice(oracle_pubkey);
@@ -682,6 +685,154 @@ pub fn oracle_authorization_challenge_scalar_from_witness(
     ))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonNativePallasValueLimbs {
+    /// Four 64-bit limbs in little-endian order: limb 0 is bits 0..63.
+    pub limbs_le: [u64; NON_NATIVE_LIMB_COUNT],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonNativePallasPointLimbs {
+    /// Affine x-coordinate over the Pallas base field.
+    pub x: NonNativePallasValueLimbs,
+    /// Affine y-coordinate over the Pallas base field.
+    pub y: NonNativePallasValueLimbs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleAuthorizationLimbWitness {
+    /// Decoded affine coordinates of the oracle public key `P`.
+    pub oracle_pubkey: NonNativePallasPointLimbs,
+    /// Decoded affine coordinates of the signature nonce point `R`.
+    pub signature_r: NonNativePallasPointLimbs,
+    /// Signature response scalar `s`.
+    pub response_s: NonNativePallasValueLimbs,
+    /// Frozen transcript challenge scalar `e`.
+    pub challenge_e: NonNativePallasValueLimbs,
+}
+
+fn field_to_non_native_limbs<F: ff::PrimeField>(value: F) -> NonNativePallasValueLimbs {
+    let repr = value.to_repr();
+    let bytes = repr.as_ref();
+    debug_assert_eq!(bytes.len(), 32);
+
+    let mut limbs = [0u64; NON_NATIVE_LIMB_COUNT];
+    for (idx, limb) in limbs.iter_mut().enumerate() {
+        let start = idx * 8;
+        let mut limb_bytes = [0u8; 8];
+        limb_bytes.copy_from_slice(&bytes[start..start + 8]);
+        *limb = u64::from_le_bytes(limb_bytes);
+    }
+
+    NonNativePallasValueLimbs { limbs_le: limbs }
+}
+
+fn limbs_to_32_le_bytes(limbs: &[u128], label: &str) -> Result<[u8; 32], String> {
+    if limbs.len() != NON_NATIVE_LIMB_COUNT {
+        return Err(format!(
+            "{label}: expected {NON_NATIVE_LIMB_COUNT} {NON_NATIVE_LIMB_BITS}-bit limbs, got {}",
+            limbs.len()
+        ));
+    }
+
+    let mut bytes = [0u8; 32];
+    for (idx, limb) in limbs.iter().enumerate() {
+        let limb = u64::try_from(*limb).map_err(|_| {
+            format!("{label}[{idx}]: limb overflows {NON_NATIVE_LIMB_BITS}-bit contract")
+        })?;
+        bytes[idx * 8..idx * 8 + 8].copy_from_slice(&limb.to_le_bytes());
+    }
+
+    Ok(bytes)
+}
+
+pub fn pallas_base_limbs_from_untrusted(
+    limbs: &[u128],
+    label: &str,
+) -> Result<NonNativePallasValueLimbs, String> {
+    let bytes = limbs_to_32_le_bytes(limbs, label)?;
+    let value = pallas::Base::from_repr(bytes)
+        .into_option()
+        .ok_or_else(|| format!("{label}: limb value is not canonical Pallas base-field element"))?;
+    Ok(field_to_non_native_limbs(value))
+}
+
+pub fn pallas_scalar_limbs_from_untrusted(
+    limbs: &[u128],
+    label: &str,
+) -> Result<NonNativePallasValueLimbs, String> {
+    let bytes = limbs_to_32_le_bytes(limbs, label)?;
+    let value = pallas::Scalar::from_repr(bytes)
+        .into_option()
+        .ok_or_else(|| format!("{label}: limb value is not canonical Pallas scalar"))?;
+    Ok(field_to_non_native_limbs(value))
+}
+
+pub fn pallas_point_limbs_from_untrusted(
+    x_limbs: &[u128],
+    y_limbs: &[u128],
+    label: &str,
+) -> Result<NonNativePallasPointLimbs, String> {
+    let x_bytes = limbs_to_32_le_bytes(x_limbs, &format!("{label}.x"))?;
+    let y_bytes = limbs_to_32_le_bytes(y_limbs, &format!("{label}.y"))?;
+    let x = pallas::Base::from_repr(x_bytes)
+        .into_option()
+        .ok_or_else(|| {
+            format!("{label}.x: limb value is not canonical Pallas base-field element")
+        })?;
+    let y = pallas::Base::from_repr(y_bytes)
+        .into_option()
+        .ok_or_else(|| {
+            format!("{label}.y: limb value is not canonical Pallas base-field element")
+        })?;
+    pallas::Affine::from_xy(x, y)
+        .into_option()
+        .ok_or_else(|| format!("{label}: affine coordinates are not on the Pallas curve"))?;
+
+    Ok(NonNativePallasPointLimbs {
+        x: field_to_non_native_limbs(x),
+        y: field_to_non_native_limbs(y),
+    })
+}
+
+fn pallas_affine_to_point_limbs(
+    point: pallas::Affine,
+    label: &str,
+) -> Result<NonNativePallasPointLimbs, String> {
+    let coordinates = point
+        .coordinates()
+        .into_option()
+        .ok_or_else(|| format!("{label}: identity point has no affine coordinates"))?;
+
+    Ok(NonNativePallasPointLimbs {
+        x: field_to_non_native_limbs(*coordinates.x()),
+        y: field_to_non_native_limbs(*coordinates.y()),
+    })
+}
+
+pub fn oracle_authorization_limb_witness(
+    oracle_pubkey: &CanonicalOraclePubkey,
+    signature: &CanonicalSchnorrSignature,
+    authorized_pubkey: &[u8; 32],
+) -> Result<OracleAuthorizationLimbWitness, String> {
+    let oracle_pubkey_bytes = oracle_pubkey.to_bytes();
+    let encoded_r = signature.r_bytes();
+    let encoded_s = signature.s_bytes();
+    let p_point = parse_canonical_pallas_point(oracle_pubkey_bytes, "oracle_pubkey")?;
+    let r_point = parse_canonical_pallas_point(encoded_r, "R")?;
+    let s_scalar = parse_canonical_pallas_scalar(encoded_s, "s")?;
+    let message_bytes = oracle_authorization_message_bytes(authorized_pubkey);
+    let challenge =
+        oracle_authorization_challenge_scalar(&oracle_pubkey_bytes, &encoded_r, &message_bytes);
+
+    Ok(OracleAuthorizationLimbWitness {
+        oracle_pubkey: pallas_affine_to_point_limbs(p_point, "oracle_pubkey")?,
+        signature_r: pallas_affine_to_point_limbs(r_point, "R")?,
+        response_s: field_to_non_native_limbs(s_scalar),
+        challenge_e: field_to_non_native_limbs(challenge),
+    })
+}
+
 pub fn oracle_signature_fields_from_bytes<F>(signature: &[u8; 64]) -> (F, F)
 where
     F: ff::PrimeField,
@@ -690,7 +841,10 @@ where
     encoded_r.copy_from_slice(&signature[..32]);
     let mut response = [0u8; 32];
     response.copy_from_slice(&signature[32..]);
-    (bytes_to_field::<F>(&encoded_r), bytes_to_field::<F>(&response))
+    (
+        bytes_to_field::<F>(&encoded_r),
+        bytes_to_field::<F>(&response),
+    )
 }
 
 pub fn oracle_signature_bytes<F>(encoded_r_field: F, response: F) -> [u8; 64]
@@ -771,13 +925,35 @@ where
             .zip(current_state[1])
             .zip(current_state[2])
             .zip(current_state[3])
-            .map(|(((a, b), c), d)| poseidon_round([a, b, c, d], *round_constant_row, mds, is_full_round));
+            .map(|(((a, b), c), d)| {
+                poseidon_round([a, b, c, d], *round_constant_row, mds, is_full_round)
+            });
 
         let next_cells = [
-            region.assign_advice(|| "poseidon_next_0", config.a, row + 1, || next_state.map(|state| state[0]))?,
-            region.assign_advice(|| "poseidon_next_1", config.b, row + 1, || next_state.map(|state| state[1]))?,
-            region.assign_advice(|| "poseidon_next_2", config.c, row + 1, || next_state.map(|state| state[2]))?,
-            region.assign_advice(|| "poseidon_next_3", config.d, row + 1, || next_state.map(|state| state[3]))?,
+            region.assign_advice(
+                || "poseidon_next_0",
+                config.a,
+                row + 1,
+                || next_state.map(|state| state[0]),
+            )?,
+            region.assign_advice(
+                || "poseidon_next_1",
+                config.b,
+                row + 1,
+                || next_state.map(|state| state[1]),
+            )?,
+            region.assign_advice(
+                || "poseidon_next_2",
+                config.c,
+                row + 1,
+                || next_state.map(|state| state[2]),
+            )?,
+            region.assign_advice(
+                || "poseidon_next_3",
+                config.d,
+                row + 1,
+                || next_state.map(|state| state[3]),
+            )?,
         ];
         current_state = [
             next_state.map(|state| state[0]),
@@ -837,16 +1013,56 @@ where
             config.s_range.enable(&mut region, 0)?;
             amount_cell.copy_advice(|| "amount_rc", &mut region, config.a, 0)?;
 
-            region.assign_advice(|| "limb_0", config.b, 0, || limbs.map(|v| F::from(v[0] as u64)))?;
-            region.assign_advice(|| "limb_1", config.c, 0, || limbs.map(|v| F::from(v[1] as u64)))?;
-            region.assign_advice(|| "limb_2", config.d, 0, || limbs.map(|v| F::from(v[2] as u64)))?;
+            region.assign_advice(
+                || "limb_0",
+                config.b,
+                0,
+                || limbs.map(|v| F::from(v[0] as u64)),
+            )?;
+            region.assign_advice(
+                || "limb_1",
+                config.c,
+                0,
+                || limbs.map(|v| F::from(v[1] as u64)),
+            )?;
+            region.assign_advice(
+                || "limb_2",
+                config.d,
+                0,
+                || limbs.map(|v| F::from(v[2] as u64)),
+            )?;
 
-            region.assign_advice(|| "limb_3", config.a, 1, || limbs.map(|v| F::from(v[3] as u64)))?;
-            region.assign_advice(|| "limb_4", config.b, 1, || limbs.map(|v| F::from(v[4] as u64)))?;
-            region.assign_advice(|| "limb_5", config.c, 1, || limbs.map(|v| F::from(v[5] as u64)))?;
-            region.assign_advice(|| "limb_6", config.d, 1, || limbs.map(|v| F::from(v[6] as u64)))?;
+            region.assign_advice(
+                || "limb_3",
+                config.a,
+                1,
+                || limbs.map(|v| F::from(v[3] as u64)),
+            )?;
+            region.assign_advice(
+                || "limb_4",
+                config.b,
+                1,
+                || limbs.map(|v| F::from(v[4] as u64)),
+            )?;
+            region.assign_advice(
+                || "limb_5",
+                config.c,
+                1,
+                || limbs.map(|v| F::from(v[5] as u64)),
+            )?;
+            region.assign_advice(
+                || "limb_6",
+                config.d,
+                1,
+                || limbs.map(|v| F::from(v[6] as u64)),
+            )?;
 
-            region.assign_advice(|| "limb_7", config.a, 2, || limbs.map(|v| F::from(v[7] as u64)))?;
+            region.assign_advice(
+                || "limb_7",
+                config.a,
+                2,
+                || limbs.map(|v| F::from(v[7] as u64)),
+            )?;
             region.assign_advice_from_constant(|| "range_padding_b2", config.b, 2, F::ZERO)?;
             region.assign_advice_from_constant(|| "range_padding_c2", config.c, 2, F::ZERO)?;
             region.assign_advice_from_constant(|| "range_padding_d2", config.d, 2, F::ZERO)?;
@@ -1027,31 +1243,36 @@ where
         // elements.
         // These cells are re-used (via copy-constraints) in every later region
         // so the prover cannot substitute different values per gate.
-        let (sender_cell, receiver_cell, oracle_pubkey_cell, amount_cell) = layouter.assign_region(
-            || "load_witness",
-            |mut region: Region<'_, F>| {
-                let sender_val = self
-                    .witness
-                    .as_ref()
-                    .map(|w| bytes_to_field::<F>(&w.sender_pubkey));
-                let receiver_val = self
-                    .witness
-                    .as_ref()
-                    .map(|w| bytes_to_field::<F>(&w.receiver_pubkey));
-                let oracle_pubkey_val = self
-                    .witness
-                    .as_ref()
-                    .map(|w| bytes_to_field::<F>(&w.oracle_pubkey));
-                let amount_val = self.witness.as_ref().map(|w| F::from(w.amount));
+        let (sender_cell, receiver_cell, oracle_pubkey_cell, amount_cell) = layouter
+            .assign_region(
+                || "load_witness",
+                |mut region: Region<'_, F>| {
+                    let sender_val = self
+                        .witness
+                        .as_ref()
+                        .map(|w| bytes_to_field::<F>(&w.sender_pubkey));
+                    let receiver_val = self
+                        .witness
+                        .as_ref()
+                        .map(|w| bytes_to_field::<F>(&w.receiver_pubkey));
+                    let oracle_pubkey_val = self
+                        .witness
+                        .as_ref()
+                        .map(|w| bytes_to_field::<F>(&w.oracle_pubkey));
+                    let amount_val = self.witness.as_ref().map(|w| F::from(w.amount));
 
-                let s = region.assign_advice(|| "sender", config.a, 0, || sender_val)?;
-                let r = region.assign_advice(|| "receiver", config.b, 0, || receiver_val)?;
-                let o =
-                    region.assign_advice(|| "oracle_pubkey", config.c, 0, || oracle_pubkey_val)?;
-                let am = region.assign_advice(|| "amount", config.d, 0, || amount_val)?;
-                Ok((s, r, o, am))
-            },
-        )?;
+                    let s = region.assign_advice(|| "sender", config.a, 0, || sender_val)?;
+                    let r = region.assign_advice(|| "receiver", config.b, 0, || receiver_val)?;
+                    let o = region.assign_advice(
+                        || "oracle_pubkey",
+                        config.c,
+                        0,
+                        || oracle_pubkey_val,
+                    )?;
+                    let am = region.assign_advice(|| "amount", config.d, 0, || amount_val)?;
+                    Ok((s, r, o, am))
+                },
+            )?;
 
         // ── Region 2: Range check on amount ──────────────────────────────
         // Copy from load_witness so the prover cannot swap a different amount
@@ -1477,7 +1698,10 @@ mod tests {
         levels
     }
 
-    fn extract_merkle_path(levels: &[Vec<Fr>], mut leaf_index: usize) -> (Vec<[u8; 32]>, Vec<bool>) {
+    fn extract_merkle_path(
+        levels: &[Vec<Fr>],
+        mut leaf_index: usize,
+    ) -> (Vec<[u8; 32]>, Vec<bool>) {
         let mut siblings = Vec::with_capacity(MERKLE_DEPTH);
         let mut directions = Vec::with_capacity(MERKLE_DEPTH);
 
@@ -1533,11 +1757,8 @@ mod tests {
         let oracle_key = bytes_to_field::<Fr>(&oracle_pubkey);
         let oracle_hash = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey);
         let authorized_hash = merkle_leaf_hash_from_pubkey::<Fr>(&authorized_pubkey);
-        let challenge = oracle_authorization_staged_challenge(
-            oracle_hash,
-            authorized_hash,
-            encoded_r_field,
-        );
+        let challenge =
+            oracle_authorization_staged_challenge(oracle_hash, authorized_hash, encoded_r_field);
         let response = encoded_r_field + challenge * oracle_key;
 
         let mut encoded = [0u8; 64];
@@ -1574,15 +1795,12 @@ mod tests {
             .expect("reference trace requires canonical Schnorr signature bytes");
         let encoded_r = signature.r_bytes();
         let encoded_s = signature.s_bytes();
-        let r_point =
-            parse_canonical_pallas_point(encoded_r, "R").expect("signature R should stay canonical");
+        let r_point = parse_canonical_pallas_point(encoded_r, "R")
+            .expect("signature R should stay canonical");
         let s_scalar = parse_canonical_pallas_scalar(encoded_s, "s")
             .expect("signature s should stay canonical");
-        let challenge = oracle_authorization_challenge_scalar(
-            &oracle_pubkey,
-            &encoded_r,
-            &message_bytes,
-        );
+        let challenge =
+            oracle_authorization_challenge_scalar(&oracle_pubkey, &encoded_r, &message_bytes);
 
         let lhs = (pallas::Point::generator() * s_scalar).to_affine();
         let rhs = (pallas::Point::from(r_point) + (pallas::Point::from(public_key) * challenge))
@@ -1641,6 +1859,67 @@ mod tests {
         vector
     }
 
+    fn limbs_as_untrusted(limbs: &NonNativePallasValueLimbs) -> Vec<u128> {
+        limbs.limbs_le.iter().map(|limb| *limb as u128).collect()
+    }
+
+    fn expected_zk15c_limb_witness() -> OracleAuthorizationLimbWitness {
+        OracleAuthorizationLimbWitness {
+            oracle_pubkey: NonNativePallasPointLimbs {
+                x: NonNativePallasValueLimbs {
+                    limbs_le: [
+                        1267450242980961722,
+                        10645116335433260706,
+                        1163257224933582228,
+                        1748025556363159615,
+                    ],
+                },
+                y: NonNativePallasValueLimbs {
+                    limbs_le: [
+                        15990046747472117586,
+                        10793421143027288225,
+                        11077669088971118010,
+                        479268384739044833,
+                    ],
+                },
+            },
+            signature_r: NonNativePallasPointLimbs {
+                x: NonNativePallasValueLimbs {
+                    limbs_le: [
+                        9302917520259771385,
+                        7637327682270764669,
+                        954791468427381403,
+                        126097670772179104,
+                    ],
+                },
+                y: NonNativePallasValueLimbs {
+                    limbs_le: [
+                        8578442944754928350,
+                        1128160295766634090,
+                        10165508844029528252,
+                        3979856683135221172,
+                    ],
+                },
+            },
+            response_s: NonNativePallasValueLimbs {
+                limbs_le: [
+                    1559995514927406047,
+                    16188451749779842550,
+                    16737362755649288745,
+                    1686976183890072913,
+                ],
+            },
+            challenge_e: NonNativePallasValueLimbs {
+                limbs_le: [
+                    18209817341830418160,
+                    4613660792214102043,
+                    5735320164431423517,
+                    3486872654835447556,
+                ],
+            },
+        }
+    }
+
     const BASELINE_MIN_K_SEARCH_START: u32 = 8;
     const BASELINE_MIN_K_SEARCH_END: u32 = 12;
     const BASELINE_MAX_ALLOWED_K: u32 = 10;
@@ -1668,7 +1947,11 @@ mod tests {
         leaves[receiver_index] = receiver_f;
 
         let tree = build_merkle_tree(leaves);
-        let root_f = *tree.last().expect("root level exists").first().expect("root exists");
+        let root_f = *tree
+            .last()
+            .expect("root level exists")
+            .first()
+            .expect("root exists");
         let (sender_merkle_siblings, sender_merkle_directions) =
             extract_merkle_path(&tree, sender_index);
         let (receiver_merkle_siblings, receiver_merkle_directions) =
@@ -1739,7 +2022,8 @@ mod tests {
                 Ok(prover) => prover,
                 Err(ErrorFront::NotEnoughRowsAvailable { .. }) => continue,
                 Err(ErrorFront::AssignError(err))
-                    if err.to_string().contains("usable_rows=") && err.to_string().contains(", k=") =>
+                    if err.to_string().contains("usable_rows=")
+                        && err.to_string().contains(", k=") =>
                 {
                     continue
                 }
@@ -1944,8 +2228,11 @@ mod tests {
     #[test]
     fn zk15d_final_transcript_valid_vector_matches_equation() {
         let vector = zk15c_reference_authorization_vector();
-        let trace = trace_schnorr_equation(vector.oracle_pubkey, vector.signature, vector.message_bytes);
-        let expected_s: [u8; 32] = vector.signature[32..].try_into().expect("signature scalar bytes");
+        let trace =
+            trace_schnorr_equation(vector.oracle_pubkey, vector.signature, vector.message_bytes);
+        let expected_s: [u8; 32] = vector.signature[32..]
+            .try_into()
+            .expect("signature scalar bytes");
 
         assert_eq!(
             trace.message_bytes, vector.message_bytes,
@@ -1969,14 +2256,20 @@ mod tests {
             trace.encoded_s, expected_s,
             "trace should expose the canonical s encoding for later gate comparisons"
         );
-        assert!(trace.equation_holds(), "valid reference vector must satisfy s*G = R + e*P");
+        assert!(
+            trace.equation_holds(),
+            "valid reference vector must satisfy s*G = R + e*P"
+        );
     }
 
     #[test]
     fn zk15d_final_transcript_tampered_vector_breaks_equation() {
         let vector = zk15c_tampered_authorization_vector();
-        let trace = trace_schnorr_equation(vector.oracle_pubkey, vector.signature, vector.message_bytes);
-        let expected_r: [u8; 32] = vector.signature[..32].try_into().expect("signature R bytes");
+        let trace =
+            trace_schnorr_equation(vector.oracle_pubkey, vector.signature, vector.message_bytes);
+        let expected_r: [u8; 32] = vector.signature[..32]
+            .try_into()
+            .expect("signature R bytes");
 
         assert!(
             !trace.equation_holds(),
@@ -1989,6 +2282,91 @@ mod tests {
         assert_eq!(
             trace.encoded_r, expected_r,
             "tampered vector should keep the same R encoding so only the response changes"
+        );
+    }
+
+    #[test]
+    fn zk15e_limb_contract_round_trips_reference_vector() {
+        let vector = zk15c_reference_authorization_vector();
+        let oracle_pubkey = canonical_oracle_pubkey_from_bytes(vector.oracle_pubkey)
+            .expect("reference oracle pubkey should be canonical");
+        let signature = canonical_schnorr_signature_from_bytes(vector.signature)
+            .expect("reference signature should be canonical");
+        let limbs =
+            oracle_authorization_limb_witness(&oracle_pubkey, &signature, &vector.sender_pubkey)
+                .expect("reference vector should decompose into non-native limbs");
+
+        assert_eq!(NON_NATIVE_LIMB_BITS, 64);
+        assert_eq!(NON_NATIVE_LIMB_COUNT, 4);
+        assert_eq!(
+            limbs,
+            expected_zk15c_limb_witness(),
+            "fixed ZK-15c vector must keep stable non-native verifier limbs"
+        );
+        assert_eq!(
+            pallas_point_limbs_from_untrusted(
+                &limbs_as_untrusted(&limbs.oracle_pubkey.x),
+                &limbs_as_untrusted(&limbs.oracle_pubkey.y),
+                "oracle_pubkey",
+            )
+            .expect("oracle pubkey limbs should reconstruct"),
+            limbs.oracle_pubkey
+        );
+        assert_eq!(
+            pallas_point_limbs_from_untrusted(
+                &limbs_as_untrusted(&limbs.signature_r.x),
+                &limbs_as_untrusted(&limbs.signature_r.y),
+                "R",
+            )
+            .expect("R limbs should reconstruct"),
+            limbs.signature_r
+        );
+        assert_eq!(
+            pallas_scalar_limbs_from_untrusted(&limbs_as_untrusted(&limbs.response_s), "s")
+                .expect("s limbs should reconstruct"),
+            limbs.response_s
+        );
+        assert_eq!(
+            pallas_scalar_limbs_from_untrusted(&limbs_as_untrusted(&limbs.challenge_e), "e")
+                .expect("e limbs should reconstruct"),
+            limbs.challenge_e
+        );
+    }
+
+    #[test]
+    fn zk15e_limb_contract_rejects_malformed_limb_sets() {
+        let vector = zk15c_reference_authorization_vector();
+        let oracle_pubkey = canonical_oracle_pubkey_from_bytes(vector.oracle_pubkey)
+            .expect("reference oracle pubkey should be canonical");
+        let signature = canonical_schnorr_signature_from_bytes(vector.signature)
+            .expect("reference signature should be canonical");
+        let limbs =
+            oracle_authorization_limb_witness(&oracle_pubkey, &signature, &vector.sender_pubkey)
+                .expect("reference vector should decompose into non-native limbs");
+
+        let mut truncated_s = limbs_as_untrusted(&limbs.response_s);
+        truncated_s.pop();
+        assert!(
+            pallas_scalar_limbs_from_untrusted(&truncated_s, "s").is_err(),
+            "truncated scalar limb set must be rejected"
+        );
+
+        let mut overflowed_e = limbs_as_untrusted(&limbs.challenge_e);
+        overflowed_e[0] = (u64::MAX as u128) + 1;
+        assert!(
+            pallas_scalar_limbs_from_untrusted(&overflowed_e, "e").is_err(),
+            "overflowed challenge limb must be rejected"
+        );
+
+        let invalid_point = (0u128..128)
+            .find(|x| {
+                pallas_point_limbs_from_untrusted(&[*x, 0, 0, 0], &[1, 0, 0, 0], "R").is_err()
+            })
+            .expect("small search should find coordinates that are not on Pallas");
+        assert!(
+            pallas_point_limbs_from_untrusted(&[invalid_point, 0, 0, 0], &[1, 0, 0, 0], "R")
+                .is_err(),
+            "tampered point coordinates must be rejected if they are not on Pallas"
         );
     }
 }

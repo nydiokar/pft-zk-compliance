@@ -64,6 +64,15 @@ frozen at the Rust boundary:
 `oracle_pubkey_hash` remains a separate circuit binding to the active oracle
 key. It is not part of the final Schnorr transcript.
 
+The witness representation consumed by the later non-native verifier is also
+fixed: decoded affine Pallas coordinates and scalars are represented as four
+64-bit little-endian limbs. The verifier ABI is `P.x`, `P.y`, `R.x`, `R.y`,
+`s`, and `e`, where limb 0 is the least-significant 64 bits. Reconstruction
+must reject wrong limb counts, limbs wider than 64 bits, non-canonical
+Pallas base/scalar values, and coordinate pairs that are not on the Pallas
+curve. This is intentionally over decoded coordinates, not over compressed
+point encodings.
+
 ## Replaces
 
 - Sidecar-only Ed25519 verification via `ed25519-dalek`

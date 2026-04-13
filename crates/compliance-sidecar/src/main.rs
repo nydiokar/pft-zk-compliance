@@ -229,8 +229,9 @@ mod inner {
     use compliance_circuit::{
         circuit::{
             canonical_oracle_pubkey_from_bytes, canonical_schnorr_signature_from_bytes,
-            merkle_leaf_hash_from_pubkey, CanonicalOraclePubkey, CanonicalSchnorrSignature,
-            PublicInputs, Witness, MERKLE_DEPTH,
+            merkle_leaf_hash_from_pubkey, oracle_authorization_limb_witness, CanonicalOraclePubkey,
+            CanonicalSchnorrSignature, OracleAuthorizationLimbWitness, PublicInputs, Witness,
+            MERKLE_DEPTH,
         },
         ComplianceCircuit,
     };
@@ -342,6 +343,8 @@ mod inner {
         pub(crate) sender_oracle_sig: CanonicalSchnorrSignature,
         pub(crate) receiver_oracle_sig: CanonicalSchnorrSignature,
         pub(crate) oracle_pubkey: CanonicalOraclePubkey,
+        pub(crate) sender_authorization_limbs: OracleAuthorizationLimbWitness,
+        pub(crate) receiver_authorization_limbs: OracleAuthorizationLimbWitness,
         pub(crate) compliance_merkle_root: [u8; 32],
         pub(crate) oracle_pubkey_hash: [u8; 32],
         pub(crate) block_height: u64,
@@ -668,7 +671,8 @@ mod inner {
         let tx_hash = decode_hex_32(&req.tx_hash, "tx_hash")?;
         let sender_pubkey = decode_hex_32(&req.sender_pubkey, "sender_pubkey")?;
         let receiver_pubkey = decode_hex_32(&req.receiver_pubkey, "receiver_pubkey")?;
-        let sender_oracle_sig = decode_oracle_signature(&req.sender_oracle_sig, "sender_oracle_sig")?;
+        let sender_oracle_sig =
+            decode_oracle_signature(&req.sender_oracle_sig, "sender_oracle_sig")?;
         let receiver_oracle_sig =
             decode_oracle_signature(&req.receiver_oracle_sig, "receiver_oracle_sig")?;
         let oracle_pubkey = decode_oracle_pubkey(&req.oracle_pubkey, "oracle_pubkey")?;
@@ -678,7 +682,9 @@ mod inner {
         let expected_oracle_pubkey_hash =
             merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey.to_bytes()).to_repr();
         if expected_oracle_pubkey_hash.as_ref() != oracle_pubkey_hash {
-            return Err("oracle_pubkey_hash does not match canonical oracle_pubkey encoding".to_string());
+            return Err(
+                "oracle_pubkey_hash does not match canonical oracle_pubkey encoding".to_string(),
+            );
         }
 
         if req.sender_merkle_siblings.len() != MERKLE_DEPTH {
@@ -718,6 +724,15 @@ mod inner {
             .enumerate()
             .map(|(i, s)| decode_hex_32_unchecked(s, &format!("receiver_merkle_siblings[{i}]")))
             .collect::<Result<_, _>>()?;
+        let sender_authorization_limbs =
+            oracle_authorization_limb_witness(&oracle_pubkey, &sender_oracle_sig, &sender_pubkey)
+                .map_err(|e| format!("sender authorization limbs: {e}"))?;
+        let receiver_authorization_limbs = oracle_authorization_limb_witness(
+            &oracle_pubkey,
+            &receiver_oracle_sig,
+            &receiver_pubkey,
+        )
+        .map_err(|e| format!("receiver authorization limbs: {e}"))?;
 
         Ok(NormalizedProofRequest {
             tx_hash,
@@ -727,6 +742,8 @@ mod inner {
             sender_oracle_sig,
             receiver_oracle_sig,
             oracle_pubkey,
+            sender_authorization_limbs,
+            receiver_authorization_limbs,
             compliance_merkle_root,
             oracle_pubkey_hash,
             block_height: req.block_height,
@@ -812,7 +829,6 @@ mod inner {
             Fr::from(u64::from_le_bytes(low))
         })
     }
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -825,9 +841,8 @@ mod tests {
     use compliance_circuit::{
         circuit::{
             merkle_leaf_hash_from_pubkey, merkle_parent_hash_fields,
-            oracle_authorization_challenge_scalar_from_witness,
-            oracle_authorization_message_bytes, tx_hash_field_from_inputs,
-            PublicInputs, Witness,
+            oracle_authorization_challenge_scalar_from_witness, oracle_authorization_limb_witness,
+            oracle_authorization_message_bytes, tx_hash_field_from_inputs, PublicInputs, Witness,
             BLOCK_HEIGHT_ROW, MERKLE_DEPTH, MERKLE_ROOT_START, NUM_INSTANCE_ROWS,
             ORACLE_PUBKEY_HASH_START, TX_HASH_START,
         },
@@ -930,7 +945,10 @@ mod tests {
         levels
     }
 
-    fn extract_merkle_path(levels: &[Vec<Fr>], mut leaf_index: usize) -> (Vec<[u8; 32]>, Vec<bool>) {
+    fn extract_merkle_path(
+        levels: &[Vec<Fr>],
+        mut leaf_index: usize,
+    ) -> (Vec<[u8; 32]>, Vec<bool>) {
         let mut siblings = Vec::with_capacity(MERKLE_DEPTH);
         let mut directions = Vec::with_capacity(MERKLE_DEPTH);
 
@@ -990,15 +1008,20 @@ mod tests {
         leaves[sender_index] = sender_f;
         leaves[receiver_index] = receiver_f;
         let tree = build_merkle_tree(leaves);
-        let root_f = *tree.last().expect("root exists").first().expect("root element exists");
+        let root_f = *tree
+            .last()
+            .expect("root exists")
+            .first()
+            .expect("root element exists");
         let (sender_merkle_siblings, sender_merkle_directions) =
             extract_merkle_path(&tree, sender_index);
         let (receiver_merkle_siblings, receiver_merkle_directions) =
             extract_merkle_path(&tree, receiver_index);
 
         let compliance_merkle_root: [u8; 32] = root_f.to_repr().into();
-        let oracle_pubkey_hash: [u8; 32] =
-            merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey).to_repr().into();
+        let oracle_pubkey_hash: [u8; 32] = merkle_leaf_hash_from_pubkey::<Fr>(&oracle_pubkey)
+            .to_repr()
+            .into();
 
         let public = PublicInputs {
             tx_hash,
@@ -1208,17 +1231,24 @@ mod tests {
         let expected_oracle = find_bn254_compatible_pallas_point(17);
         assert_eq!(normalized.oracle_pubkey.to_bytes(), expected_oracle);
         assert_eq!(normalized.sender_merkle_siblings.len(), MERKLE_DEPTH);
-        assert_eq!(normalized.sender_merkle_directions, vec![false, true, false, true]);
-        assert_eq!(normalized.receiver_merkle_directions, vec![true, false, true, false]);
+        assert_eq!(
+            normalized.sender_merkle_directions,
+            vec![false, true, false, true]
+        );
+        assert_eq!(
+            normalized.receiver_merkle_directions,
+            vec![true, false, true, false]
+        );
     }
 
     #[test]
     fn zk15d_final_transcript_survives_request_normalization() {
         let raw = zk15c_reference_request_json().to_string();
-        let req: ProofRequest = serde_json::from_str(&raw).expect("reference request should deserialize");
+        let req: ProofRequest =
+            serde_json::from_str(&raw).expect("reference request should deserialize");
         let normalized = normalize_request(req).expect("reference request should normalize");
-        let expected_message_bytes =
-            hex::decode(ZK15C_REFERENCE_MESSAGE_BYTES_HEX).expect("reference message bytes should decode");
+        let expected_message_bytes = hex::decode(ZK15C_REFERENCE_MESSAGE_BYTES_HEX)
+            .expect("reference message bytes should decode");
         let expected_signature =
             hex::decode(ZK15C_REFERENCE_SIGNATURE_HEX).expect("reference signature should decode");
         let expected_oracle_pubkey = hex::decode(ZK15C_REFERENCE_ORACLE_PUBKEY_HEX)
@@ -1265,6 +1295,40 @@ mod tests {
             })
             .unwrap_or(false),
             "reference request must derive the finalized Schnorr challenge from canonical normalized witness bytes"
+        );
+    }
+
+    #[test]
+    fn zk15e_reference_request_derives_verifier_limb_contract() {
+        let raw = zk15c_reference_request_json().to_string();
+        let req: ProofRequest =
+            serde_json::from_str(&raw).expect("reference request should deserialize");
+        let normalized = normalize_request(req).expect("reference request should normalize");
+        let expected_sender_limbs = oracle_authorization_limb_witness(
+            &normalized.oracle_pubkey,
+            &normalized.sender_oracle_sig,
+            &normalized.sender_pubkey,
+        )
+        .expect("normalized sender auth should decompose into non-native limbs");
+        let expected_receiver_limbs = oracle_authorization_limb_witness(
+            &normalized.oracle_pubkey,
+            &normalized.receiver_oracle_sig,
+            &normalized.receiver_pubkey,
+        )
+        .expect("normalized receiver auth should decompose into non-native limbs");
+
+        assert_eq!(
+            normalized.sender_authorization_limbs, expected_sender_limbs,
+            "sidecar normalization must preserve the shared sender limb ABI"
+        );
+        assert_eq!(
+            normalized.receiver_authorization_limbs, expected_receiver_limbs,
+            "sidecar normalization must preserve the shared receiver limb ABI"
+        );
+        assert_ne!(
+            normalized.sender_authorization_limbs.challenge_e,
+            normalized.receiver_authorization_limbs.challenge_e,
+            "sender and receiver challenges should stay message-specific"
         );
     }
 

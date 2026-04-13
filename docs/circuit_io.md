@@ -137,6 +137,12 @@ Current implementation status:
   witness path.
 - The production Rust-side Schnorr transcript is now frozen so later non-native
   gates have a fixed contract to target.
+- The non-native verifier witness ABI is now fixed as decoded affine Pallas
+  coordinates and scalars split into four 64-bit little-endian limbs:
+  `P.x`, `P.y`, `R.x`, `R.y`, `s`, and `e`. Limb 0 carries bits 0..63.
+  Reconstruction rejects any limb set with the wrong length, any limb wider
+  than 64 bits, any non-canonical Pallas base/scalar value, and any affine
+  coordinate pair that is not on the Pallas curve.
 - The circuit has not yet reached the final verifier shape. It still uses a
   temporary staged scalar relation internally, and the full non-native
   Schnorr-over-Pasta equation remains future work.
